@@ -222,9 +222,12 @@ static void build_material_table() {
 }
 
 static void clear_material_table() {
-    for (auto handle : material_handles) {
-        if (handle) Textures::deleteHandle(handle);
-    }
+    // Do NOT call Textures::deleteHandle here.
+    // deleteHandle's internal `while (surface->refcount) DFSDL_FreeSurface(surface)` loop
+    // reads from the SDL_Surface struct after it has been freed (UB). On release builds of
+    // dfhack.dll the freed memory is non-zero, causing a second FreeSurface on a dangling
+    // pointer and a crash inside SDL2. The abandoned handles remain in dfhack's texture
+    // registry and are cleaned up by Textures::cleanup() when DFHack shuts down.
     material_handles.clear();
 }
 
