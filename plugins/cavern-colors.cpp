@@ -1348,6 +1348,64 @@ static command_result dump_texture(color_ostream &out,
 }
 
 // ---------------------------------------------------------------------------
+// Debug: rewrite every opaque pixel of the SDL_Surface backing the given
+// texpos to solid red, in place. Used to test whether DF's renderer actually
+// re-reads pixel data from enabler->textures.raws on each frame (so an
+// in-place edit of a boulder-overlay sprite would propagate to the rendered
+// rough-edge bleed), or whether it has uploaded the bitmap once to GPU at
+// world-load and ignores subsequent buffer changes. If the leak turns red
+// in-game after this command, in-place tinting is viable for the real fix.
+static command_result paint_overlay(color_ostream &out,
+                                    std::vector<std::string> &params) {
+    if (params.size() < 2) {
+        out.printerr("Usage: cavern-colors paint-overlay <texpos>\n");
+        return CR_WRONG_USAGE;
+    }
+    if (!enabler) {
+        out.printerr("enabler not available\n");
+        return CR_FAILURE;
+    }
+    int32_t texpos = std::atoi(params[1].c_str());
+    if (texpos <= 0 || (size_t)texpos >= enabler->textures.raws.size()) {
+        out.printerr("texpos {} out of range\n", texpos);
+        return CR_FAILURE;
+    }
+    SDL_Surface *src = (SDL_Surface *)enabler->textures.raws[texpos];
+    if (!src) {
+        out.printerr("no surface at texpos {}\n", texpos);
+        return CR_FAILURE;
+    }
+
+    int w = src->w, h = src->h;
+    int bpp = src->format->BytesPerPixel;
+    int pitch = src->pitch;
+    uint32_t Amask = src->format->Amask;
+    uint32_t Rmask = src->format->Rmask;
+    uint32_t Gmask = src->format->Gmask;
+    uint32_t Bmask = src->format->Bmask;
+
+    int touched = 0;
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = (uint8_t *)src->pixels + y * pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t *p = row + x * bpp;
+            uint32_t pix = 0;
+            for (int b = 0; b < bpp; b++) pix |= (uint32_t)p[b] << (b * 8);
+            if (Amask && (pix & Amask) == 0) continue; // skip transparent
+            // Keep original alpha, clear RGB, set R to all-ones in its mask.
+            uint32_t newpix = (pix & Amask) | Rmask;
+            (void)Gmask; (void)Bmask;
+            for (int b = 0; b < bpp; b++) p[b] = (newpix >> (b * 8)) & 0xff;
+            touched++;
+        }
+    }
+    out.print("texpos {}: painted {} opaque pixels red "
+              "(format bpp={}, Rmask=0x{:x}, Amask=0x{:x})\n",
+              texpos, touched, bpp, Rmask, Amask);
+    return CR_OK;
+}
+
+// ---------------------------------------------------------------------------
 // For each material with a collected wall-overlay texpos, dump the overlay's
 // color palette. Each overlay encodes DF's authoritative per-material color
 // ramp: a few alpha-sorted RGB stops representing shadow / midtone /
@@ -1550,6 +1608,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("       cavern-colors dump-cache\n");
                 out.print("       cavern-colors sample-cell [<wx> <wy> [<wz>]]   (default: mouse pos)\n");
                 out.print("       cavern-colors dump-texture <texpos>\n");
+                out.print("       cavern-colors paint-overlay <texpos>\n");
                 out.print("       cavern-colors extract-palette\n");
                 out.print("       cavern-colors dump-wall-graphics\n");
                 out.print("       cavern-colors dump-baked\n");
@@ -1652,6 +1711,10 @@ DFhackCExport command_result plugin_init(color_ostream &out,
 
             if (params[0] == "dump-texture") {
                 return dump_texture(out, params);
+            }
+
+            if (params[0] == "paint-overlay") {
+                return paint_overlay(out, params);
             }
 
             if (params[0] == "extract-palette") {
