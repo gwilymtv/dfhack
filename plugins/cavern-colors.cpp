@@ -280,6 +280,125 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
     return h;
 }
 
+// ---------------------------------------------------------------------------
+// Rough-edge bleed ("leaks")
+//
+// DF composites a per-side overlay onto cells adjacent to rough cavern
+// tiles. The overlay sprite is read from
+// world->raws.descriptors.boulder_floor_graphics_info, keyed by
+// (color_index, texture_index). Although the table is keyed by color_index,
+// the 8 entries DF actually generates carry a single material's palette
+// baked in (whichever material seeded the table at world-load) and DF
+// reuses them for *all* rough cavern materials. Result: every leak is drawn
+// in that one baked palette regardless of the rough source's material.
+//
+// The neighbour cell selects which overlays to composite via
+// screentexpos_floor_flag[idx], a uint64 packed as one byte per cardinal:
+//
+//   byte 0 (bits  0-7):  S
+//   byte 1 (bits  8-15): W
+//   byte 2 (bits 16-23): E
+//   byte 3 (bits 24-31): N
+//
+// Within each byte: bits 0-2 = texture_index (matches boulder_floor_graphics
+// entries 0..7), bit 3 = enable. Bytes 4-7 unobserved so far (likely
+// diagonals); cardinal coverage is the first cut. DF's renderer uploads the
+// overlay sprite to GPU at world-load and ignores later edits to the
+// SDL_Surface buffer (verified with paint-overlay), so we can't tint the
+// overlay in place. The fix is to bake a composite sprite per cell:
+// (base sprite tinted by base mat) + alpha-blended (overlay re-tinted by
+// the rough neighbour's mat), register it via Textures::createTile, point
+// screentexpos_background at the new texpos, and zero floor_flag[idx] so
+// DF doesn't redraw the original untinted overlay on top.
+
+static bool leaks_enabled = true;
+
+// Snapshot of each overlay sprite's pixels, RGBA32, keyed by texture_index.
+struct overlay_snapshot {
+    int w = 0, h = 0;
+    std::vector<uint32_t> pixels;
+};
+static std::array<overlay_snapshot, 8> overlay_snapshots;
+
+struct rough_side_info {
+    int dx, dy;
+    int byte_offset; // floor_flag byte index
+};
+static const std::array<rough_side_info, 4> ROUGH_SIDES = {{
+    { 0, +1, 0}, // S (byte 0)
+    {-1,  0, 1}, // W (byte 1)
+    {+1,  0, 2}, // E (byte 2)
+    { 0, -1, 3}, // N (byte 3)
+}};
+
+// Composite cache key. (base_texpos, floor_flag, per-side rough neighbour
+// mats, base mat) uniquely determines the composite output.
+struct composite_key {
+    int32_t base_texpos;
+    uint64_t floor_flag;
+    int16_t base_mat;
+    int16_t mat_s, mat_w, mat_e, mat_n;
+    bool operator==(const composite_key &o) const {
+        return base_texpos == o.base_texpos && floor_flag == o.floor_flag &&
+               base_mat == o.base_mat &&
+               mat_s == o.mat_s && mat_w == o.mat_w &&
+               mat_e == o.mat_e && mat_n == o.mat_n;
+    }
+};
+struct composite_key_hash {
+    size_t operator()(const composite_key &k) const {
+        size_t h = std::hash<uint64_t>()(k.floor_flag);
+        auto mix = [&h](uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix((uint32_t)k.base_texpos);
+        mix((uint16_t)k.base_mat);
+        mix((uint16_t)k.mat_s);
+        mix((uint16_t)k.mat_w);
+        mix((uint16_t)k.mat_e);
+        mix((uint16_t)k.mat_n);
+        return h;
+    }
+};
+static std::unordered_map<composite_key, TexposHandle, composite_key_hash>
+    composite_cache;
+
+static void snapshot_overlays() {
+    for (auto &s : overlay_snapshots) s = {};
+    if (!world || !enabler) return;
+    auto &table = world->raws.descriptors.boulder_floor_graphics_info;
+    for (auto *info : table) {
+        if (!info) continue;
+        int ti = info->flags.bits.texture_index;
+        if (ti < 0 || ti >= (int)overlay_snapshots.size()) continue;
+        if (info->texpos <= 0 ||
+            (size_t)info->texpos >= enabler->textures.raws.size()) continue;
+        SDL_Surface *src =
+            (SDL_Surface *)enabler->textures.raws[info->texpos];
+        if (!src) continue;
+        SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
+        if (!fmt) continue;
+        SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
+        if (!conv) continue;
+        auto &snap = overlay_snapshots[ti];
+        snap.w = conv->w;
+        snap.h = conv->h;
+        snap.pixels.assign((size_t)snap.w * snap.h, 0);
+        for (int y = 0; y < snap.h; y++) {
+            uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
+            memcpy(&snap.pixels[(size_t)y * snap.w], row, (size_t)snap.w * 4);
+        }
+        DFSDL_FreeSurface(conv);
+        DEBUG(log).print(
+            "snapshotted boulder overlay ti={} src_texpos={} {}x{}\n",
+            ti, info->texpos, snap.w, snap.h);
+    }
+}
+
+static void clear_composite_cache() {
+    composite_cache.clear();
+}
+
 static void clear_tinted_cache() {
     // Workaround: not calling Textures::deleteHandle.
     //
@@ -842,6 +961,156 @@ static std::string format_palette_cpp(const std::string &id,
                                       const palette_t &p);
 
 // ---------------------------------------------------------------------------
+// Composite sprite generation for rough-edge leaks. See the "Rough-edge
+// bleed" section header above for the model and motivation.
+
+// Re-tint a single overlay pixel for a target material. The cached overlay
+// pixels carry whatever palette DF baked at world-load (in practice always
+// one specific material, regardless of who the rough source actually is on
+// the map). We treat each pixel as a luminance value, then apply the same
+// brightness-boost-then-multiply-by-material-tint math that the base sprite
+// uses. That preserves the overlay's shading texture while swapping its
+// hue/saturation to the target material.
+static uint32_t retint_overlay_pixel(uint32_t src, int mat) {
+    uint8_t r = src & 0xff;
+    uint8_t g = (src >> 8) & 0xff;
+    uint8_t b = (src >> 16) & 0xff;
+    uint8_t a = (src >> 24) & 0xff;
+    if (a == 0) return 0;
+    if (mat < 0 || (size_t)mat >= material_tints.size()) return src;
+    float lum = (0.299f * r + 0.587f * g + 0.114f * b) / 255.0f;
+    float s = std::clamp(tint_strength, 0.0f, 1.0f);
+    float boost = std::max(brightness_boost, 0.0f);
+    auto lerp_white = [s](uint8_t c) -> uint8_t {
+        return (uint8_t)std::clamp(c * s + 255.0f * (1.0f - s), 0.0f, 255.0f);
+    };
+    uint8_t mr = lerp_white(material_tints[mat][0]);
+    uint8_t mg = lerp_white(material_tints[mat][1]);
+    uint8_t mb = lerp_white(material_tints[mat][2]);
+    float lb = std::min(lum * boost, 1.0f);
+    int new_r = (int)std::clamp(lb * mr, 0.0f, 255.0f);
+    int new_g = (int)std::clamp(lb * mg, 0.0f, 255.0f);
+    int new_b = (int)std::clamp(lb * mb, 0.0f, 255.0f);
+    return rgba((uint8_t)new_r, (uint8_t)new_g, (uint8_t)new_b, a);
+}
+
+// Bake a composite: tinted base sprite + per-side tinted overlays.
+static TexposHandle make_composite(const composite_key &key) {
+    if (!enabler) return 0;
+    if (key.base_texpos <= 0 ||
+        (size_t)key.base_texpos >= enabler->textures.raws.size()) return 0;
+    SDL_Surface *base_src =
+        (SDL_Surface *)enabler->textures.raws[key.base_texpos];
+    if (!base_src) return 0;
+    SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
+    if (!fmt) return 0;
+    SDL_Surface *conv = DFSDL_ConvertSurface(base_src, fmt, 0);
+    if (!conv) return 0;
+    int w = conv->w, h = conv->h;
+    std::vector<uint32_t> pixels((size_t)w * h);
+
+    // 1. Tint base by base material (if known and in our tint table). This
+    // mirrors make_tinted_from's per-channel boost-then-multiply pipeline.
+    float s = std::clamp(tint_strength, 0.0f, 1.0f);
+    float boost = std::max(brightness_boost, 0.0f);
+    auto lerp_white = [s](uint8_t c) -> uint8_t {
+        return (uint8_t)std::clamp(c * s + 255.0f * (1.0f - s), 0.0f, 255.0f);
+    };
+    bool tint_base = key.base_mat >= 0 &&
+                     (size_t)key.base_mat < material_tints.size();
+    uint8_t mr = 255, mg = 255, mb = 255;
+    if (tint_base) {
+        mr = lerp_white(material_tints[key.base_mat][0]);
+        mg = lerp_white(material_tints[key.base_mat][1]);
+        mb = lerp_white(material_tints[key.base_mat][2]);
+    }
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t *p = row + x * 4;
+            uint8_t pr = p[0], pg = p[1], pb = p[2], pa = p[3];
+            if (tint_base) {
+                int br = (int)(pr * boost); if (br > 255) br = 255;
+                int bg = (int)(pg * boost); if (bg > 255) bg = 255;
+                int bb = (int)(pb * boost); if (bb > 255) bb = 255;
+                pr = (uint8_t)(br * mr / 255);
+                pg = (uint8_t)(bg * mg / 255);
+                pb = (uint8_t)(bb * mb / 255);
+            }
+            pixels[(size_t)y * w + x] = rgba(pr, pg, pb, pa);
+        }
+    }
+    DFSDL_FreeSurface(conv);
+
+    // 2. Alpha-blend each enabled side's overlay (re-tinted by the rough
+    // neighbour's mat) on top.
+    int16_t side_mats[4] = { key.mat_s, key.mat_w, key.mat_e, key.mat_n };
+    for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
+        int byte = (int)((key.floor_flag >>
+                          (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
+        if (!(byte & 0x08)) continue;
+        int ti = byte & 0x07;
+        if (ti < 0 || ti >= (int)overlay_snapshots.size()) continue;
+        const auto &snap = overlay_snapshots[ti];
+        if (snap.pixels.empty()) continue;
+        if (snap.w != w || snap.h != h) continue;
+        int16_t mat = side_mats[i];
+        if (mat < 0) continue;
+        for (size_t p = 0; p < snap.pixels.size(); p++) {
+            uint32_t ov = retint_overlay_pixel(snap.pixels[p], mat);
+            uint8_t oa = (ov >> 24) & 0xff;
+            if (oa == 0) continue;
+            uint32_t base = pixels[p];
+            uint8_t br = base & 0xff, bg = (base >> 8) & 0xff;
+            uint8_t bb = (base >> 16) & 0xff, ba = (base >> 24) & 0xff;
+            uint8_t or_ = ov & 0xff, og = (ov >> 8) & 0xff;
+            uint8_t ob = (ov >> 16) & 0xff;
+            int inv = 255 - oa;
+            uint8_t nr = (uint8_t)((or_ * oa + br * inv) / 255);
+            uint8_t ng = (uint8_t)((og * oa + bg * inv) / 255);
+            uint8_t nb = (uint8_t)((ob * oa + bb * inv) / 255);
+            uint8_t na = std::max(ba, oa);
+            pixels[p] = rgba(nr, ng, nb, na);
+        }
+    }
+
+    return Textures::createTile(pixels, w, h, true);
+}
+
+static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
+                                  int wx, int wy, int wz, int base_mat) {
+    composite_key key{};
+    key.base_texpos = base_texpos;
+    key.floor_flag = floor_flag;
+    key.base_mat = (int16_t)base_mat;
+    int16_t side_mats[4] = { -1, -1, -1, -1 };
+    for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
+        int byte = (int)((floor_flag >>
+                          (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
+        if (!(byte & 0x08)) continue;
+        int nx = wx + ROUGH_SIDES[i].dx;
+        int ny = wy + ROUGH_SIDES[i].dy;
+        df::map_block *nb = Maps::getTileBlock(nx, ny, wz);
+        if (!nb) continue;
+        df::tiletype *nt = Maps::getTileType(df::coord(nx, ny, wz));
+        if (!nt) continue;
+        int m = get_tile_mat(nb, nx & 15, ny & 15, *nt);
+        if (m >= 0 && (size_t)m < material_tints.size())
+            side_mats[i] = (int16_t)m;
+    }
+    key.mat_s = side_mats[0];
+    key.mat_w = side_mats[1];
+    key.mat_e = side_mats[2];
+    key.mat_n = side_mats[3];
+
+    auto it = composite_cache.find(key);
+    if (it != composite_cache.end()) return it->second;
+    TexposHandle h = make_composite(key);
+    composite_cache[key] = h;
+    return h;
+}
+
+// ---------------------------------------------------------------------------
 // Render hook
 
 struct cavern_colors_hook : df::viewscreen_dwarfmodest {
@@ -886,25 +1155,33 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                 // collect_walls only gates the verbose texpos-tracking maps.
                 if (!is_floor_like && !is_wall)
                     continue;
-                // Only tint actual stone surfaces. Floor coverings like fungus,
-                // moss, grass, or player constructions sit on top of (or
-                // replace) the mineral and shouldn't be recolored.
-                switch (tileMaterial(*tt)) {
-                case df::tiletype_material::STONE:
-                case df::tiletype_material::MINERAL:
-                case df::tiletype_material::LAVA_STONE:
-                    break;
-                default:
+                // Stone-like materials get base-sprite tinting. Other floor
+                // surfaces (constructions, fungus, moss, grass) keep their
+                // own appearance but still need leak processing — DF
+                // composites rough-edge overlays from neighbouring rough
+                // cavern tiles onto *any* adjacent floor, regardless of
+                // what that floor is made of.
+                auto tile_mat_enum = tileMaterial(*tt);
+                bool is_stone_like =
+                    tile_mat_enum == df::tiletype_material::STONE ||
+                    tile_mat_enum == df::tiletype_material::MINERAL ||
+                    tile_mat_enum == df::tiletype_material::LAVA_STONE;
+                if (is_wall && !is_stone_like)
                     continue;
-                }
 
                 df::map_block *block = Maps::getTileBlock(wx, wy, wz);
                 if (!block) continue;
 
-                int mat = get_tile_mat(block, wx & 15, wy & 15, *tt);
-                if (mat < 0 || (size_t)mat >= material_tints.size()) continue;
+                int mat = -1;
+                if (is_stone_like) {
+                    mat = get_tile_mat(block, wx & 15, wy & 15, *tt);
+                    if (mat < 0 ||
+                        (size_t)mat >= material_tints.size())
+                        mat = -1;
+                }
 
                 if (is_wall) {
+                    if (mat < 0) continue;
                     int32_t overlay =
                         vp->screentexpos_background_two[idx];
 
@@ -962,11 +1239,38 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                     continue;
                 }
 
-                TexposHandle h = get_tinted(src_texpos, mat);
-                if (!h) continue;
-                long texpos = Textures::getTexposByHandle(h);
-                if (texpos > 0)
-                    vp->screentexpos_background[idx] = (int32_t)texpos;
+                // Floor-like (FLOOR/RAMP/STAIR). Two paths:
+                //  - composite: when the cell has rough-edge bits set in
+                //    floor_flag and leak processing is enabled. The composite
+                //    handles both base-mat tint (if any) and the per-side
+                //    overlay re-tinted by the rough neighbour's material.
+                //  - plain tint: cell has no leak bits, just tint by base
+                //    material. Skipped when base is non-stone (e.g.
+                //    constructions) since we have no material to tint by.
+                uint64_t flag = 0;
+                if (leaks_enabled &&
+                    shape == df::tiletype_shape_basic::Floor &&
+                    vp->screentexpos_floor_flag)
+                    flag = vp->screentexpos_floor_flag[idx];
+
+                if (flag != 0) {
+                    TexposHandle h = get_composite(src_texpos, flag,
+                                                   wx, wy, wz, mat);
+                    if (!h) continue;
+                    long texpos = Textures::getTexposByHandle(h);
+                    if (texpos > 0) {
+                        vp->screentexpos_background[idx] = (int32_t)texpos;
+                        // Suppress DF's own overlay redraw — the composite
+                        // already bakes in the tinted version.
+                        vp->screentexpos_floor_flag[idx] = 0;
+                    }
+                } else if (mat >= 0) {
+                    TexposHandle h = get_tinted(src_texpos, mat);
+                    if (!h) continue;
+                    long texpos = Textures::getTexposByHandle(h);
+                    if (texpos > 0)
+                        vp->screentexpos_background[idx] = (int32_t)texpos;
+                }
             }
         }
     }
@@ -1604,6 +1908,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("       cavern-colors boost <float>      (brightness multiplier, default 2.0)\n");
                 out.print("       cavern-colors strength <0..1>    (tint saturation, default 1.0)\n");
                 out.print("       cavern-colors enable|disable\n");
+                out.print("       cavern-colors leaks on|off       (rough-edge bleed tinting; default on)\n");
                 out.print("       cavern-colors collect-walls on|off\n");
                 out.print("       cavern-colors dump-cache\n");
                 out.print("       cavern-colors sample-cell [<wx> <wy> [<wz>]]   (default: mouse pos)\n");
@@ -1616,6 +1921,9 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("Brightness boost: {}\n", brightness_boost);
                 out.print("Tint strength:    {}\n", tint_strength);
                 out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
+                out.print("Leak tinting:     {} ({} composite(s) cached)\n",
+                         leaks_enabled ? "on" : "off",
+                         composite_cache.size());
                 out.print("Collecting walls: {} ({} mat(s) base / "
                          "{} mat(s) overlay)\n",
                          collect_walls ? "yes" : "no",
@@ -1655,6 +1963,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 if (new_mode != color_mode) {
                     color_mode = new_mode;
                     clear_tinted_cache();
+                    clear_composite_cache();
                     build_material_tints();
                     out.print("cavern-colors mode set to '{}'\n", params[1]);
                 }
@@ -1676,6 +1985,25 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                     out.print("cavern-colors tint strength set to {}\n", tint_strength);
                 }
                 clear_tinted_cache();
+                clear_composite_cache();
+                return CR_OK;
+            }
+
+            if (params[0] == "leaks" && params.size() >= 2) {
+                if (params[1] == "on") {
+                    leaks_enabled = true;
+                    out.print("rough-edge leak tinting: on\n");
+                } else if (params[1] == "off") {
+                    leaks_enabled = false;
+                    clear_composite_cache();
+                    out.print("rough-edge leak tinting: off "
+                              "(composite cache cleared; rough edges will "
+                              "show DF's default untinted overlay until you "
+                              "scroll past them so DF re-paints)\n");
+                } else {
+                    out.printerr("Expected 'on' or 'off'\n");
+                    return CR_WRONG_USAGE;
+                }
                 return CR_OK;
             }
 
@@ -1755,15 +2083,18 @@ DFhackCExport void plugin_onstatechange(color_ostream &out, state_change_event e
         build_material_tints();
         build_geology();
         seed_palettes_from_baked();
+        snapshot_overlays();
         break;
     case SC_WORLD_UNLOADED:
         clear_tinted_cache();
+        clear_composite_cache();
         material_tints.clear();
         layer_mats.clear();
         wall_texposes_by_mat.clear();
         wall_overlay_texposes_by_mat.clear();
         palette_by_mat.clear();
         observed_overlays.clear();
+        for (auto &s : overlay_snapshots) s = {};
         break;
     default:
         break;
