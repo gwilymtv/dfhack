@@ -34,8 +34,6 @@
 #include "df/viewscreen_dwarfmodest.h"
 #include "df/wall_graphics_infost.h"
 #include "df/world.h"
-#include "df/world_data.h"
-#include "df/world_underground_region.h"
 
 #include <SDL_pixels.h>
 #include <SDL_surface.h>
@@ -1199,44 +1197,6 @@ static command_result sample_cell(color_ostream &out,
         out.print(" ({})",
                   world->raws.inorganics.all[feat_mat_index]->id);
     out.print("\n");
-
-    // Even if the designation feature bits are clear, a subterranean tile may
-    // still belong to an underground region (cavern / magma sea / etc.)
-    // whose feature_init holds the canonical material. Scan all underground
-    // regions whose any-chunk z-range contains this tile's z, regardless of
-    // (rx, ry) coordinate filtering — for diagnostics it's enough to show
-    // each candidate and its material.
-    if (world->world_data) {
-        size_t hits = 0;
-        for (auto *r : world->world_data->underground_regions) {
-            if (!r) continue;
-            bool z_in_range = false;
-            for (size_t i = 0; i < r->region_min_z.size(); i++) {
-                if (i >= r->region_max_z.size()) break;
-                if (world_pos.z >= r->region_min_z[i] &&
-                    world_pos.z <= r->region_max_z[i]) {
-                    z_in_range = true;
-                    break;
-                }
-            }
-            if (!z_in_range) continue;
-            int16_t rmt = -1; int32_t rmi = -1;
-            if (r->feature_init)
-                r->feature_init->getMaterial(&rmt, &rmi);
-            out.print("  underground_region[{}]: depth={}  feature_init={}  "
-                      "-> mat_type={} mat_index={}",
-                      r->index, (int)r->layer_depth,
-                      (void *)r->feature_init, rmt, rmi);
-            if (rmi >= 0 &&
-                (size_t)rmi < world->raws.inorganics.all.size())
-                out.print(" ({})",
-                          world->raws.inorganics.all[rmi]->id);
-            out.print("\n");
-            hits++;
-        }
-        if (hits == 0)
-            out.print("  underground_region: (none at this z)\n");
-    }
 
     int mat = get_tile_mat(block, tx, ty, *tt);
     if (mat >= 0 && (size_t)mat < world->raws.inorganics.all.size()) {
