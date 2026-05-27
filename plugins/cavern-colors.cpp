@@ -311,10 +311,10 @@ DFhackCExport command_result plugin_init(color_ostream &out,
             if (params.empty()) {
                 out.print("Usage: cavern-colors mode <hybrid|mat_rgb|basic_color>\n");
                 out.print("       cavern-colors enable|disable\n");
-                out.print("Current mode: %s\n",
+                out.print("Current mode: {}\n",
                           color_mode == ColorMode::hybrid     ? "hybrid" :
                           color_mode == ColorMode::mat_rgb    ? "mat_rgb" : "basic_color");
-                out.print("Enabled: %s\n", is_enabled ? "yes" : "no");
+                out.print("Enabled: {}\n", is_enabled ? "yes" : "no");
                 return CR_OK;
             }
 
@@ -330,20 +330,20 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 else if (params[1] == "mat_rgb")     new_mode = ColorMode::mat_rgb;
                 else if (params[1] == "basic_color") new_mode = ColorMode::basic_color;
                 else {
-                    out.printerr("Unknown mode '%s'. Use: hybrid, mat_rgb, basic_color\n",
-                                 params[1].c_str());
+                    out.printerr("Unknown mode '{}'. Use: hybrid, mat_rgb, basic_color\n",
+                                 params[1]);
                     return CR_WRONG_USAGE;
                 }
                 if (new_mode != color_mode) {
                     color_mode = new_mode;
                     clear_material_table();
                     build_material_table();
-                    out.print("cavern-colors mode set to '%s'\n", params[1].c_str());
+                    out.print("cavern-colors mode set to '{}'\n", params[1]);
                 }
                 return CR_OK;
             }
 
-            out.printerr("Unknown argument '%s'\n", params[0].c_str());
+            out.printerr("Unknown argument '{}'\n", params[0]);
             return CR_WRONG_USAGE;
         }
     ));
