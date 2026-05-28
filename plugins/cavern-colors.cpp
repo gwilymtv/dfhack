@@ -529,23 +529,18 @@ static int get_vein_mat(df::map_block *block, int tx, int ty) {
     return last;
 }
 
-// TODO: MapExtras::Block::layerMaterialAt(p) returns this directly per-tile
-// (using biomeInfoAt to pick the right region), without us maintaining
-// layer_mats. The home-region override below is the part to verify still
-// applies before swapping.
+// TODO: MapExtras::Block::layerMaterialAt(p) returns this directly per-tile.
 static int get_layer_mat(df::map_block *block, int tx, int ty) {
     auto &des = block->designation[tx][ty];
-    // Always override the per-tile biome bits with eHere (=4, the embark's
-    // home region). DF's display uses the home-region geology for layer
-    // stone regardless of per-tile biome attribution, both above- and
-    // below-ground. Per-tile biome bits at boundaries get mis-attributed
-    // to neighbouring regions, which makes our material lookup return
-    // the wrong stone (e.g. LIMESTONE in the south neighbour's biome
-    // where the home region's layer at that depth is SHALE). The same
-    // mis-attribution affects above-ground tiles near surface biome
-    // boundaries — shale getting tinted as limestone, etc. — so we
-    // unconditionally use the home region.
-    int biome = 4 /* eHere */;
+    // des.bits.biome is a per-tile slot index (0..8); block->region_offset[]
+    // translates it to the cardinal-direction slot that layer_mats /
+    // ReadGeology is indexed by. Hardcoding "Here" (=4) here is wrong:
+    // region_offset[] varies per block, and ReadGeology's 3x3 is centred on
+    // the embark's NW-corner world region — so the literal "4" only happens
+    // to land on the right geology in some saves.
+    uint8_t bslot = des.bits.biome;
+    if (bslot >= 9) return -1;
+    int biome = block->region_offset[bslot];
     int geolayer = des.bits.geolayer_index;
     if (biome < 0 || (size_t)biome >= layer_mats.size()) return -1;
     auto &row = layer_mats[biome];
@@ -1038,6 +1033,39 @@ static void sample_cell(color_ostream &out, int wx, int wy, int wz) {
               (int)dsgn.bits.feature_local, (int)dsgn.bits.feature_global,
               (int)dsgn.bits.subterranean, (int)dsgn.bits.light,
               (int)dsgn.bits.outside);
+
+    // region_offset[] translates the per-tile biome slot to the cardinal
+    // slot that layer_mats is indexed by. This is the value get_layer_mat
+    // actually uses; print the full row so a wrong tint can be diagnosed
+    // against the geology cache directly.
+    {
+        uint8_t bslot = dsgn.bits.biome;
+        out.print("  region_offset[{}]", (int)bslot);
+        if (bslot < 9) {
+            int resolved = block->region_offset[bslot];
+            out.print(" = {}", resolved);
+            if (resolved >= 0 && (size_t)resolved < layer_mats.size()) {
+                auto &row = layer_mats[resolved];
+                int gl = dsgn.bits.geolayer_index;
+                if (gl >= 0 && (size_t)gl < row.size()) {
+                    int m = row[gl];
+                    const char *name = "?";
+                    if (m >= 0 && (size_t)m < world->raws.inorganics.all.size())
+                        name = world->raws.inorganics.all[m]->id.c_str();
+                    out.print("  -> layer_mats[{}][{}] = {} ({})",
+                              resolved, gl, m, name);
+                }
+            }
+        } else {
+            out.print(" (out of range)");
+        }
+        out.print("\n");
+        // Full row of region_offset for context (only 9 entries).
+        out.print("  region_offset = [");
+        for (int i = 0; i < 9; ++i)
+            out.print("{}{}", (int)block->region_offset[i], i == 8 ? "" : ",");
+        out.print("]\n");
+    }
 
     // Block-level feature indices.
     out.print("  block: region_pos=({},{}), local_feature={}, "
