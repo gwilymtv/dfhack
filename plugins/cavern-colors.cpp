@@ -69,7 +69,7 @@ namespace DFHack {
 // ---------------------------------------------------------------------------
 // Color mode
 
-enum class ColorMode { hybrid, mat_rgb, basic_color, build_color, tile_color };
+enum class ColorMode { hybrid, mat_rgb, basic_color };
 static ColorMode color_mode = ColorMode::hybrid;
 
 static const char *mode_name(ColorMode m) {
@@ -77,8 +77,6 @@ static const char *mode_name(ColorMode m) {
     case ColorMode::hybrid:      return "hybrid";
     case ColorMode::mat_rgb:     return "mat_rgb";
     case ColorMode::basic_color: return "basic_color";
-    case ColorMode::build_color: return "build_color";
-    case ColorMode::tile_color:  return "tile_color";
     }
     return "?";
 }
@@ -110,9 +108,6 @@ static uint32_t rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
 }
 
-// build_color and tile_color are [fg, bg, bright] triples. We only sample the
-// foreground for tinting; the background slot would only matter if we wanted
-// to render the tile's ASCII glyph composite.
 static void palette_tint(int fg, int bright,
                          uint8_t &tr, uint8_t &tg, uint8_t &tb) {
     int idx = std::clamp(fg, 0, 7) + (bright ? 8 : 0);
@@ -131,18 +126,9 @@ static bool get_tint(const df::material &mat, uint8_t &tr, uint8_t &tg, uint8_t 
         tb = (uint8_t)(std::clamp(mat.mat_rgb[2], 0.0f, 1.0f) * 255.0f);
         if (tr || tg || tb) return true;
     }
-    switch (color_mode) {
-    case ColorMode::build_color:
-        palette_tint(mat.build_color[0], mat.build_color[2], tr, tg, tb);
-        return true;
-    case ColorMode::tile_color:
-        palette_tint(mat.tile_color[0], mat.tile_color[2], tr, tg, tb);
-        return true;
-    default:
-        // hybrid fallback and basic_color mode both use basic_color
-        palette_tint(mat.basic_color[0], mat.basic_color[1], tr, tg, tb);
-        return true;
-    }
+    // hybrid fallback and basic_color mode both use basic_color
+    palette_tint(mat.basic_color[0], mat.basic_color[1], tr, tg, tb);
+    return true;
 }
 
 // Tint math (clamp-source-first multiply with saturation control):
@@ -193,23 +179,15 @@ static void build_material_tints() {
         if (!inorganics[i]) continue;
         auto &m = inorganics[i]->material;
         get_tint(m, material_tints[i][0], material_tints[i][1], material_tints[i][2]);
-        // Dump every color field DF carries on a material so they can be
-        // compared/experimented with in an image editor. mat_rgb is the
-        // modern premium float RGB (0..1). basic_color is [fg, bright] into
-        // the 16-color CGA palette. build_color/tile_color are [fg, bg, bright]
-        // triples used by the legacy renderer for constructed items and tiles.
         int bc_idx = std::clamp((int)m.basic_color[0], 0, 7) + (m.basic_color[1] ? 8 : 0);
         DEBUG(log).print(
             "material {}: tint={}/{}/{} mat_rgb={:.3f}/{:.3f}/{:.3f} "
-            "basic_color=[{},{}] (palette#{} -> {}/{}/{}) "
-            "build_color=[{},{},{}] tile_color=[{},{},{}]\n",
+            "basic_color=[{},{}] (palette#{} -> {}/{}/{})\n",
             inorganics[i]->id,
             material_tints[i][0], material_tints[i][1], material_tints[i][2],
             m.mat_rgb[0], m.mat_rgb[1], m.mat_rgb[2],
             m.basic_color[0], m.basic_color[1],
-            bc_idx, DF_PALETTE[bc_idx][0], DF_PALETTE[bc_idx][1], DF_PALETTE[bc_idx][2],
-            m.build_color[0], m.build_color[1], m.build_color[2],
-            m.tile_color[0], m.tile_color[1], m.tile_color[2]);
+            bc_idx, DF_PALETTE[bc_idx][0], DF_PALETTE[bc_idx][1], DF_PALETTE[bc_idx][2]);
     }
     DEBUG(log).print("computed tints for {} inorganic materials\n",
                      material_tints.size());
@@ -275,7 +253,7 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 }
 
 // ---------------------------------------------------------------------------
-// Rough-edge bleed ("leaks")
+// Rough-edge bleed
 //
 // DF composites a per-side overlay onto cells adjacent to rough cavern
 // tiles. The fringe sprites come from vanilla floors.png, which packs a
@@ -314,7 +292,7 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 // screentexpos_background[idx], zero floor_flag[idx] to suppress DF's
 // own untinted overlay redraw.
 
-static bool leaks_enabled = true;
+static bool rough_edges_enabled = true;
 
 // One fringe sprite per direction (4 cardinals + 4 diagonals), loaded
 // once from floors.png at world-load. Indexed by ROUGH_SIDES position:
@@ -464,7 +442,7 @@ static void snapshot_overlays() {
     DFSDL_FreeSurface(conv);
 
     color_ostream_proxy c(Core::getInstance().getConsole());
-    c.print("[cavern-colors] loaded leak fringes from floors.png "
+    c.print("[cavern-colors] loaded rough-edge fringes from floors.png "
             "(S:{} W:{} E:{} N:{} NE:{} SE:{} SW:{} NW:{})\n",
             overlay_by_dir[0].valid ? "ok" : "-",
             overlay_by_dir[1].valid ? "ok" : "-",
@@ -561,7 +539,7 @@ static int get_tile_mat(df::map_block *block, int tx, int ty, df::tiletype tt) {
 
 
 // ---------------------------------------------------------------------------
-// Composite sprite generation for rough-edge leaks. See the "Rough-edge
+// Composite sprite generation for rough-edge bleed. See the "Rough-edge
 // bleed" section header above for the model and motivation.
 
 // Re-tint a single overlay pixel for a target material. The cached overlay
@@ -705,7 +683,7 @@ static TexposHandle make_composite(const composite_key &key) {
 // side contributes 0xff at its byte offset). Sides whose neighbour
 // isn't a rough-stone tile we recognise stay 0 in the mask — the
 // caller should leave those bytes in floor_flag intact so DF can
-// render its natural overlay (grass leaks, etc.) for them.
+// render its natural overlay (grass bleed, etc.) for them.
 // Returns 0 if no sides resolved — in that case the caller should
 // fall back to plain base-sprite tinting.
 static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
@@ -786,7 +764,7 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                 if (!is_floor_like) continue;
                 // Stone-like materials get base-sprite tinting. Other
                 // floor surfaces (constructions, fungus, moss, grass)
-                // keep their own appearance but still need leak
+                // keep their own appearance but still need rough-edge
                 // processing — DF composites rough-edge overlays from
                 // neighbouring rough cavern tiles onto *any* adjacent
                 // floor, regardless of what that floor is made of.
@@ -809,19 +787,21 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
 
                 // Floor-like (FLOOR/RAMP/STAIR). Two paths:
                 //  - composite: when the cell has rough-edge bits set in
-                //    floor_flag and leak processing is enabled. The composite
-                //    handles both base-mat tint (if any) and the per-side
-                //    overlay re-tinted by the rough neighbour's material.
-                //  - plain tint: cell has no leak bits, just tint by base
-                //    material. Skipped when base is non-stone (e.g.
+                //    floor_flag and rough-edge processing is enabled. The
+                //    composite handles both base-mat tint (if any) and the
+                //    per-side overlay re-tinted by the rough neighbour's
+                //    material.
+                //  - plain tint: cell has no rough-edge bits, just tint by
+                //    base material. Skipped when base is non-stone (e.g.
                 //    constructions) since we have no material to tint by.
                 uint64_t flag = 0;
-                if (leaks_enabled &&
+                if (rough_edges_enabled &&
                     shape == df::tiletype_shape_basic::Floor &&
                     vp->screentexpos_floor_flag) {
                     // Only take the composite path if we have at least one
                     // directional overlay; otherwise the composite would
-                    // strip DF's own leak draw and replace it with nothing.
+                    // strip DF's own rough-edge draw and replace it with
+                    // nothing.
                     bool have_any = false;
                     for (auto &o : overlay_by_dir)
                         if (o.valid) { have_any = true; break; }
@@ -836,9 +816,9 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                                       consumed);
                 }
                 if (!h && mat >= 0) {
-                    // No rough-stone sides to composite (or leaks
+                    // No rough-stone sides to composite (or rough-edges
                     // disabled). Fall back to plain base tinting so
-                    // DF's natural leak overlays (grass, etc.) keep
+                    // DF's natural bleed overlays (grass, etc.) keep
                     // rendering through floor_flag.
                     h = get_tinted(src_texpos, mat);
                 }
@@ -850,7 +830,7 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                         // Suppress DF's own overlay redraw for the
                         // sides we already baked into the composite.
                         // Leave other sides' bytes intact so DF can
-                        // still render grass/other natural leaks for
+                        // still render grass/other natural bleed for
                         // those sides.
                         vp->screentexpos_floor_flag[idx] = flag & ~consumed;
                     }
@@ -1116,11 +1096,14 @@ DFhackCExport command_result plugin_init(color_ostream &out,
         "Restore per-mineral floor colors in premium graphics mode.",
         [](color_ostream &out, std::vector<std::string> &params) -> command_result {
             if (params.empty()) {
-                out.print("Usage: cavern-colors mode <hybrid|mat_rgb|basic_color|build_color|tile_color>\n");
+                out.print("Usage: cavern-colors mode <hybrid|mat_rgb|basic_color>\n");
+                out.print("         hybrid      = mat_rgb when the material has one, else basic_color\n");
+                out.print("         mat_rgb     = modern premium float RGB only (uncolored if unset)\n");
+                out.print("         basic_color = legacy 16-color CGA palette (always available)\n");
                 out.print("       cavern-colors boost <float>      (brightness multiplier, default 2.0)\n");
                 out.print("       cavern-colors strength <0..1>    (tint saturation, default 0.8)\n");
                 out.print("       cavern-colors enable|disable\n");
-                out.print("       cavern-colors leaks on|off       (rough-edge bleed tinting; default on)\n");
+                out.print("       cavern-colors rough-edges on|off (rough-edge bleed tinting; default on)\n");
                 out.print("       cavern-colors sample-cell [<wx> <wy> [<wz>]]   (default: mouse pos)\n");
                 out.print("       cavern-colors dump-texture <texpos>\n");
                 out.print("Current mode:     {}\n", mode_name(color_mode));
@@ -1135,11 +1118,11 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                     int row = o.source_texpos % 100;
                     return fmt::format("c{}r{}", col, row);
                 };
-                out.print("Leak tinting:     {} "
+                out.print("Rough edges:      {} "
                           "({} composite(s) cached, fringes "
                           "S:{} W:{} E:{} N:{} "
                           "NE:{} SE:{} SW:{} NW:{})\n",
-                          leaks_enabled ? "on" : "off",
+                          rough_edges_enabled ? "on" : "off",
                           composite_cache.size(),
                           dir_label(overlay_by_dir[0]),
                           dir_label(overlay_by_dir[1]),
@@ -1163,11 +1146,9 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 if      (params[1] == "hybrid")      new_mode = ColorMode::hybrid;
                 else if (params[1] == "mat_rgb")     new_mode = ColorMode::mat_rgb;
                 else if (params[1] == "basic_color") new_mode = ColorMode::basic_color;
-                else if (params[1] == "build_color") new_mode = ColorMode::build_color;
-                else if (params[1] == "tile_color")  new_mode = ColorMode::tile_color;
                 else {
-                    out.printerr("Unknown mode '{}'. Use: hybrid, mat_rgb, basic_color, "
-                                 "build_color, tile_color\n", params[1]);
+                    out.printerr("Unknown mode '{}'. Use: hybrid, mat_rgb, basic_color\n",
+                                 params[1]);
                     return CR_WRONG_USAGE;
                 }
                 if (new_mode != color_mode) {
@@ -1199,14 +1180,14 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 return CR_OK;
             }
 
-            if (params[0] == "leaks" && params.size() >= 2) {
+            if (params[0] == "rough-edges" && params.size() >= 2) {
                 if (params[1] == "on") {
-                    leaks_enabled = true;
-                    out.print("rough-edge leak tinting: on\n");
+                    rough_edges_enabled = true;
+                    out.print("rough-edge tinting: on\n");
                 } else if (params[1] == "off") {
-                    leaks_enabled = false;
+                    rough_edges_enabled = false;
                     clear_composite_cache();
-                    out.print("rough-edge leak tinting: off "
+                    out.print("rough-edge tinting: off "
                               "(composite cache cleared; rough edges will "
                               "show DF's default untinted overlay until you "
                               "scroll past them so DF re-paints)\n");

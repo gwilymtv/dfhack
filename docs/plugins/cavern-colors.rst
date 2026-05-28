@@ -22,10 +22,15 @@ Usage
 
     cavern-colors enable|disable
     cavern-colors mode <hybrid|mat_rgb|basic_color>
+    cavern-colors boost <float>
+    cavern-colors strength <0..1>
+    cavern-colors rough-edges on|off
+    cavern-colors sample-cell [<wx> <wy> [<wz>]]
+    cavern-colors dump-texture <texpos>
     cavern-colors
 
-Running the command with no arguments prints the current mode and enabled
-state.
+Running the command with no arguments prints the current mode, tuning
+values, and cache stats.
 
 Color modes
 -----------
@@ -44,6 +49,41 @@ Color modes
     raws). Faithful to ASCII-mode colors; fewer shades but universally
     present for all minerals.
 
+Tuning
+------
+
+``boost <float>`` (default ``2.0``)
+    Brightness multiplier applied to each source pixel before the material
+    tint is multiplied in. Compensates for DF's carved-stone sprites being
+    darker than the surface they represent.
+
+``strength <0..1>`` (default ``0.8``)
+    Tint saturation. ``1.0`` is the full per-material color; ``0.0`` lerps
+    the tint all the way to white (no color shift). Lower values keep more
+    of the original sprite's neutral shading.
+
+Rough-edge bleed
+----------------
+
+When a rough cavern floor sits next to a smoothed or constructed floor of a
+different mineral, DF draws fringe sprites that bleed the rough tile's
+material a few pixels into its neighbour. ``cavern-colors`` tints those
+fringes with the rough neighbour's color and composites them under any
+corner fringes (which appear automatically where two cardinals both have
+rough neighbours). Toggle with ``cavern-colors rough-edges on|off``;
+default is on.
+
+Debug commands
+--------------
+
+``sample-cell [<wx> <wy> [<wz>]]``
+    Dump the tile, material, texpos, and ``floor_flag`` bytes for a single
+    cell. Defaults to the cell under the mouse cursor.
+
+``dump-texture <texpos>``
+    Dump the unique-pixel histogram of a texture in DF's atlas. Useful when
+    investigating how a sprite is colored or composited.
+
 Notes
 -----
 
@@ -53,5 +93,5 @@ Notes
   variation DF applies to stone floors) is not preserved.
 - The texture table is built once when a world is loaded, so there is no
   per-frame CPU overhead beyond the viewport scan and texpos writes.
-- The mode can be changed at runtime; the texture table is rebuilt
-  immediately.
+- The mode, boost, and strength can all be changed at runtime; the texture
+  cache is rebuilt immediately.
