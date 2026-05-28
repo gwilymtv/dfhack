@@ -323,25 +323,33 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 
 static bool leaks_enabled = true;
 
-// One fringe sprite per cardinal direction, loaded once from
-// floors.png at world-load. Indexed by ROUGH_SIDES position:
-// 0=S, 1=W, 2=E, 3=N.
+// One fringe sprite per direction (4 cardinals + 4 diagonals), loaded
+// once from floors.png at world-load. Indexed by ROUGH_SIDES position:
+// 0=S 1=W 2=E 3=N 4=NE 5=SE 6=SW 7=NW.
 struct directional_overlay {
     bool valid = false;
     int w = 0, h = 0;
     std::vector<uint32_t> pixels;
     int32_t source_texpos = 0; // synthetic id: col*100+row (1-based)
 };
-static std::array<directional_overlay, 4> overlay_by_dir;
+static std::array<directional_overlay, 8> overlay_by_dir;
 struct rough_side_info {
     int dx, dy;
     int byte_offset; // floor_flag byte index
 };
-static const std::array<rough_side_info, 4> ROUGH_SIDES = {{
-    { 0, +1, 0}, // S (byte 0)
-    {-1,  0, 1}, // W (byte 1)
-    {+1,  0, 2}, // E (byte 2)
-    { 0, -1, 3}, // N (byte 3)
+// Order: cardinals first, then diagonals. The cardinal byte offsets are
+// confirmed by sample-cell; diagonal offsets are a starting hypothesis
+// (bytes 4-7 in NE/SE/SW/NW order). If a diagonal leak renders on the
+// wrong corner, permute the byte_offset values below until they match.
+static const std::array<rough_side_info, 8> ROUGH_SIDES = {{
+    { 0, +1, 0}, // S  (byte 0, confirmed)
+    {-1,  0, 1}, // W  (byte 1, confirmed)
+    {+1,  0, 2}, // E  (byte 2, confirmed)
+    { 0, -1, 3}, // N  (byte 3, confirmed)
+    {+1, -1, 4}, // NE (byte 4, hypothesis)
+    {+1, +1, 5}, // SE (byte 5, hypothesis)
+    {-1, +1, 6}, // SW (byte 6, hypothesis)
+    {-1, -1, 7}, // NW (byte 7, hypothesis)
 }};
 
 // Composite cache key. (base_texpos, floor_flag, per-side rough neighbour
@@ -350,12 +358,13 @@ struct composite_key {
     int32_t base_texpos;
     uint64_t floor_flag;
     int16_t base_mat;
-    int16_t mat_s, mat_w, mat_e, mat_n;
+    int16_t mat[8]; // indexed by ROUGH_SIDES position
     bool operator==(const composite_key &o) const {
-        return base_texpos == o.base_texpos && floor_flag == o.floor_flag &&
-               base_mat == o.base_mat &&
-               mat_s == o.mat_s && mat_w == o.mat_w &&
-               mat_e == o.mat_e && mat_n == o.mat_n;
+        if (base_texpos != o.base_texpos || floor_flag != o.floor_flag ||
+            base_mat != o.base_mat) return false;
+        for (int i = 0; i < 8; i++)
+            if (mat[i] != o.mat[i]) return false;
+        return true;
     }
 };
 struct composite_key_hash {
@@ -366,10 +375,7 @@ struct composite_key_hash {
         };
         mix((uint32_t)k.base_texpos);
         mix((uint16_t)k.base_mat);
-        mix((uint16_t)k.mat_s);
-        mix((uint16_t)k.mat_w);
-        mix((uint16_t)k.mat_e);
-        mix((uint16_t)k.mat_n);
+        for (int i = 0; i < 8; i++) mix((uint16_t)k.mat[i]);
         return h;
     }
 };
@@ -399,9 +405,10 @@ static void clear_composite_cache();
 //   1 W  → (col 3, row 5)  PNG-E
 //   2 E  → (col 1, row 5)  PNG-W
 //   3 N  → (col 2, row 6)  PNG-S
-//
-// Diagonals are present in the same cluster but unused for now (floor_flag
-// diagonal bytes aren't decoded yet).
+//   4 NE → (col 1, row 6)  PNG-SW
+//   5 SE → (col 1, row 4)  PNG-NW
+//   6 SW → (col 3, row 4)  PNG-NE
+//   7 NW → (col 3, row 6)  PNG-SE
 static void snapshot_overlays() {
     for (auto &o : overlay_by_dir) o = {};
     auto path = Filesystem::getcwd() /
@@ -439,20 +446,28 @@ static void snapshot_overlays() {
             memcpy(&snap.pixels[(size_t)dy * 32], row, 32 * 4);
         }
     };
-    extract(0, 2, 4); // S receiver → PNG N (above centre)
-    extract(1, 3, 5); // W receiver → PNG E (right of centre)
-    extract(2, 1, 5); // E receiver → PNG W (left of centre)
-    extract(3, 2, 6); // N receiver → PNG S (below centre)
+    extract(0, 2, 4); // S  receiver → PNG N  (above centre)
+    extract(1, 3, 5); // W  receiver → PNG E  (right of centre)
+    extract(2, 1, 5); // E  receiver → PNG W  (left of centre)
+    extract(3, 2, 6); // N  receiver → PNG S  (below centre)
+    extract(4, 1, 6); // NE receiver → PNG SW (bottom-left of cluster)
+    extract(5, 1, 4); // SE receiver → PNG NW (top-left of cluster)
+    extract(6, 3, 4); // SW receiver → PNG NE (top-right of cluster)
+    extract(7, 3, 6); // NW receiver → PNG SE (bottom-right of cluster)
 
     DFSDL_FreeSurface(conv);
 
     color_ostream_proxy c(Core::getInstance().getConsole());
     c.print("[cavern-colors] loaded leak fringes from floors.png "
-            "(S:{} W:{} E:{} N:{})\n",
+            "(S:{} W:{} E:{} N:{} NE:{} SE:{} SW:{} NW:{})\n",
             overlay_by_dir[0].valid ? "ok" : "-",
             overlay_by_dir[1].valid ? "ok" : "-",
             overlay_by_dir[2].valid ? "ok" : "-",
-            overlay_by_dir[3].valid ? "ok" : "-");
+            overlay_by_dir[3].valid ? "ok" : "-",
+            overlay_by_dir[4].valid ? "ok" : "-",
+            overlay_by_dir[5].valid ? "ok" : "-",
+            overlay_by_dir[6].valid ? "ok" : "-",
+            overlay_by_dir[7].valid ? "ok" : "-");
 }
 
 static void clear_composite_cache() {
@@ -1104,7 +1119,6 @@ static TexposHandle make_composite(const composite_key &key) {
 
     // 2. Alpha-blend each enabled side's overlay (re-tinted by the rough
     // neighbour's mat) on top.
-    int16_t side_mats[4] = { key.mat_s, key.mat_w, key.mat_e, key.mat_n };
     for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
         int byte_value = (int)((key.floor_flag >>
                                 (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
@@ -1112,7 +1126,7 @@ static TexposHandle make_composite(const composite_key &key) {
         const auto &dir_overlay = overlay_by_dir[i];
         if (!dir_overlay.valid) continue;
         if (dir_overlay.w != w || dir_overlay.h != h) continue;
-        int16_t mat = side_mats[i];
+        int16_t mat = key.mat[i];
         if (mat < 0) continue;
         for (size_t p = 0; p < dir_overlay.pixels.size(); p++) {
             uint32_t ov = retint_overlay_pixel(dir_overlay.pixels[p], mat);
@@ -1141,7 +1155,7 @@ static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
     key.base_texpos = base_texpos;
     key.floor_flag = floor_flag;
     key.base_mat = (int16_t)base_mat;
-    int16_t side_mats[4] = { -1, -1, -1, -1 };
+    for (int i = 0; i < 8; i++) key.mat[i] = -1;
     for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
         int byte = (int)((floor_flag >>
                           (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
@@ -1154,12 +1168,8 @@ static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
         if (!nt) continue;
         int m = get_tile_mat(nb, nx & 15, ny & 15, *nt);
         if (m >= 0 && (size_t)m < material_tints.size())
-            side_mats[i] = (int16_t)m;
+            key.mat[i] = (int16_t)m;
     }
-    key.mat_s = side_mats[0];
-    key.mat_w = side_mats[1];
-    key.mat_e = side_mats[2];
-    key.mat_n = side_mats[3];
 
     auto it = composite_cache.find(key);
     if (it != composite_cache.end()) return it->second;
@@ -2057,13 +2067,18 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 };
                 out.print("Leak tinting:     {} "
                           "({} composite(s) cached, fringes "
-                          "S:{} W:{} E:{} N:{})\n",
+                          "S:{} W:{} E:{} N:{} "
+                          "NE:{} SE:{} SW:{} NW:{})\n",
                           leaks_enabled ? "on" : "off",
                           composite_cache.size(),
                           dir_label(overlay_by_dir[0]),
                           dir_label(overlay_by_dir[1]),
                           dir_label(overlay_by_dir[2]),
-                          dir_label(overlay_by_dir[3]));
+                          dir_label(overlay_by_dir[3]),
+                          dir_label(overlay_by_dir[4]),
+                          dir_label(overlay_by_dir[5]),
+                          dir_label(overlay_by_dir[6]),
+                          dir_label(overlay_by_dir[7]));
                 out.print("Collecting walls: {} ({} mat(s) base / "
                          "{} mat(s) overlay)\n",
                          collect_walls ? "yes" : "no",
