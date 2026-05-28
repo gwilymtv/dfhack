@@ -337,32 +337,45 @@ struct rough_side_info {
     int dx, dy;
     int byte_offset; // floor_flag byte index
 };
-// Order: cardinals first, then diagonals. The cardinal byte offsets are
-// confirmed by sample-cell; diagonal offsets are a starting hypothesis
-// (bytes 4-7 in NE/SE/SW/NW order). If a diagonal leak renders on the
-// wrong corner, permute the byte_offset values below until they match.
-static const std::array<rough_side_info, 8> ROUGH_SIDES = {{
-    { 0, +1, 0}, // S  (byte 0, confirmed)
-    {-1,  0, 1}, // W  (byte 1, confirmed)
-    {+1,  0, 2}, // E  (byte 2, confirmed)
-    { 0, -1, 3}, // N  (byte 3, confirmed)
-    {+1, -1, 4}, // NE (byte 4, hypothesis)
-    {+1, +1, 5}, // SE (byte 5, hypothesis)
-    {-1, +1, 6}, // SW (byte 6, hypothesis)
-    {-1, -1, 7}, // NW (byte 7, hypothesis)
+static const std::array<rough_side_info, 4> ROUGH_SIDES = {{
+    { 0, +1, 0}, // S (byte 0)
+    {-1,  0, 1}, // W (byte 1)
+    {+1,  0, 2}, // E (byte 2)
+    { 0, -1, 3}, // N (byte 3)
 }};
 
-// Composite cache key. (base_texpos, floor_flag, per-side rough neighbour
-// mats, base mat) uniquely determines the composite output.
+// Corners aren't encoded in floor_flag at all — DF draws a corner fringe
+// whenever both of its constituent cardinals have rough neighbours. The
+// corner sprite is rendered UNDER the two cardinal fringes (corners
+// fill, cardinals overlay). The corner takes its tint from the first of
+// its two cardinals that has a resolved material; if neither resolves we
+// skip it.
+struct corner_info {
+    int dx, dy;        // neighbour offset (informational)
+    int cardinal_a;    // ROUGH_SIDES index of first constituent
+    int cardinal_b;    // ROUGH_SIDES index of second constituent
+    int overlay_index; // overlay_by_dir slot (4..7)
+};
+static const std::array<corner_info, 4> ROUGH_CORNERS = {{
+    { +1, -1, 3, 2, 4 }, // NE: N + E → overlay slot 4
+    { +1, +1, 0, 2, 5 }, // SE: S + E → slot 5
+    { -1, +1, 0, 1, 6 }, // SW: S + W → slot 6
+    { -1, -1, 3, 1, 7 }, // NW: N + W → slot 7
+}};
+
+// Composite cache key. (base_texpos, floor_flag, per-cardinal rough
+// neighbour mats, base mat) uniquely determines the composite output.
+// Corners are derived deterministically from the cardinal mats so they
+// don't need their own cache fields.
 struct composite_key {
     int32_t base_texpos;
     uint64_t floor_flag;
     int16_t base_mat;
-    int16_t mat[8]; // indexed by ROUGH_SIDES position
+    int16_t mat[4]; // indexed by ROUGH_SIDES position (cardinals only)
     bool operator==(const composite_key &o) const {
         if (base_texpos != o.base_texpos || floor_flag != o.floor_flag ||
             base_mat != o.base_mat) return false;
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 4; i++)
             if (mat[i] != o.mat[i]) return false;
         return true;
     }
@@ -375,7 +388,7 @@ struct composite_key_hash {
         };
         mix((uint32_t)k.base_texpos);
         mix((uint16_t)k.base_mat);
-        for (int i = 0; i < 8; i++) mix((uint16_t)k.mat[i]);
+        for (int i = 0; i < 4; i++) mix((uint16_t)k.mat[i]);
         return h;
     }
 };
@@ -1117,19 +1130,17 @@ static TexposHandle make_composite(const composite_key &key) {
     }
     DFSDL_FreeSurface(conv);
 
-    // 2. Alpha-blend each enabled side's overlay (re-tinted by the rough
-    // neighbour's mat) on top.
-    for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
-        int byte_value = (int)((key.floor_flag >>
-                                (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
-        if (!(byte_value & 0x08)) continue;
-        const auto &dir_overlay = overlay_by_dir[i];
-        if (!dir_overlay.valid) continue;
-        if (dir_overlay.w != w || dir_overlay.h != h) continue;
-        int16_t mat = key.mat[i];
-        if (mat < 0) continue;
-        for (size_t p = 0; p < dir_overlay.pixels.size(); p++) {
-            uint32_t ov = retint_overlay_pixel(dir_overlay.pixels[p], mat);
+    // 2. Alpha-blend overlays on top of the tinted base, in layer order:
+    //    corners (lower) → cardinals (upper). DF renders corner fringes
+    //    only when both their constituent cardinals are present, and
+    //    cardinals draw over corners so the corner shape fills in gaps
+    //    between the two cardinal strips.
+    auto blend_overlay = [&](const directional_overlay &overlay, int16_t mat) {
+        if (!overlay.valid) return;
+        if (overlay.w != w || overlay.h != h) return;
+        if (mat < 0) return;
+        for (size_t p = 0; p < overlay.pixels.size(); p++) {
+            uint32_t ov = retint_overlay_pixel(overlay.pixels[p], mat);
             uint8_t oa = (ov >> 24) & 0xff;
             if (oa == 0) continue;
             uint32_t base = pixels[p];
@@ -1144,6 +1155,27 @@ static TexposHandle make_composite(const composite_key &key) {
             uint8_t na = std::max(ba, oa);
             pixels[p] = rgba(nr, ng, nb, na);
         }
+    };
+
+    auto enabled = [&](int cardinal_idx) {
+        int byte_value = (int)((key.floor_flag >>
+                                (ROUGH_SIDES[cardinal_idx].byte_offset * 8))
+                               & 0xff);
+        return (byte_value & 0x08) != 0;
+    };
+
+    // Corners first (lower layer).
+    for (const auto &cn : ROUGH_CORNERS) {
+        if (!enabled(cn.cardinal_a) || !enabled(cn.cardinal_b)) continue;
+        int16_t mat = key.mat[cn.cardinal_a];
+        if (mat < 0) mat = key.mat[cn.cardinal_b];
+        blend_overlay(overlay_by_dir[cn.overlay_index], mat);
+    }
+
+    // Cardinals second (upper layer).
+    for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
+        if (!enabled((int)i)) continue;
+        blend_overlay(overlay_by_dir[i], key.mat[i]);
     }
 
     return Textures::createTile(pixels, w, h, true);
@@ -1155,7 +1187,7 @@ static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
     key.base_texpos = base_texpos;
     key.floor_flag = floor_flag;
     key.base_mat = (int16_t)base_mat;
-    for (int i = 0; i < 8; i++) key.mat[i] = -1;
+    for (int i = 0; i < 4; i++) key.mat[i] = -1;
     for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
         int byte = (int)((floor_flag >>
                           (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
