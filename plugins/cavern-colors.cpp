@@ -176,7 +176,7 @@ static bool get_tint(const df::material &mat, uint8_t &tr, uint8_t &tg, uint8_t 
 //      shifts hue — pale materials blow out to pure white, claystone
 //      goes vibrant orange.
 static float brightness_boost = 2.0f;
-static float tint_strength = 1.0f;
+static float tint_strength = 0.8f;
 
 // Per-material RGB tint, indexed by inorganic_mat. Stored 0-255 (no boost
 // applied here; the boost is applied per-pixel so we can clamp).
@@ -2104,7 +2104,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
             if (params.empty()) {
                 out.print("Usage: cavern-colors mode <hybrid|mat_rgb|basic_color|build_color|tile_color>\n");
                 out.print("       cavern-colors boost <float>      (brightness multiplier, default 2.0)\n");
-                out.print("       cavern-colors strength <0..1>    (tint saturation, default 1.0)\n");
+                out.print("       cavern-colors strength <0..1>    (tint saturation, default 0.8)\n");
                 out.print("       cavern-colors enable|disable\n");
                 out.print("       cavern-colors leaks on|off       (rough-edge bleed tinting; default on)\n");
                 out.print("       cavern-colors collect-walls on|off\n");
