@@ -9,6 +9,8 @@
 // preserved while the color is applied.
 
 #include "Debug.h"
+#include "LuaTools.h"
+#include "PluginLua.h"
 #include "PluginManager.h"
 #include "TileTypes.h"
 #include "VTableInterpose.h"
@@ -38,7 +40,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -493,8 +495,20 @@ static void clear_tinted_cache() {
 //   to look up the layer's inorganic material via the geology cache.
 // LAVA_STONE: typically obsidian and not represented in the geology layers;
 //   fall back to the vein lookup (block events sometimes mark these tiles).
+//
+// TODO: consider switching to MapExtras::Block (modules/MapCache.h):
+//   - baseMaterialAt(p) covers vein + layer + feature stone in one call
+//   - lavaStoneAt(p) is a first-class lookup (replaces our LAVA_STONE
+//     vein-fallback heuristic)
+//   - layerMaterialAt(p) / biomeInfoAt(p).layer_stone[] replaces our
+//     build_geology cache below
+// This is on a per-frame hot path (~80x80 cells x up to 9 z-levels), and
+// MapCache is built for editing rather than read-only sampling, so the
+// trade-off needs measuring before switching.
 
 // layer_mats[biome_idx][geolayer_idx] -> inorganic_mat. Built once per world.
+// TODO: see MapExtras note above — biomeInfoAt(p).layer_stone[] gives the
+// same data per-block without us caching it ourselves.
 static std::vector<std::vector<int16_t>> layer_mats;
 
 static void build_geology() {
@@ -504,6 +518,7 @@ static void build_geology() {
     DEBUG(log).print("loaded geology for {} biomes\n", layer_mats.size());
 }
 
+// TODO: MapExtras::Block::veinMaterialAt / baseMaterialAt would replace this.
 static int get_vein_mat(df::map_block *block, int tx, int ty) {
     int last = -1;
     for (auto *ev : block->block_events) {
@@ -514,6 +529,10 @@ static int get_vein_mat(df::map_block *block, int tx, int ty) {
     return last;
 }
 
+// TODO: MapExtras::Block::layerMaterialAt(p) returns this directly per-tile
+// (using biomeInfoAt to pick the right region), without us maintaining
+// layer_mats. The home-region override below is the part to verify still
+// applies before swapping.
 static int get_layer_mat(df::map_block *block, int tx, int ty) {
     auto &des = block->designation[tx][ty];
     // Always override the per-tile biome bits with eHere (=4, the embark's
@@ -534,6 +553,9 @@ static int get_layer_mat(df::map_block *block, int tx, int ty) {
     return row[geolayer];
 }
 
+// TODO: MapExtras::Block::baseMaterialAt(p) collapses these three cases plus
+// feature stone into a single lookup, and lavaStoneAt(p) replaces the
+// LAVA_STONE → vein heuristic with the proper biome lava-stone material.
 static int get_tile_mat(df::map_block *block, int tx, int ty, df::tiletype tt) {
     switch (tileMaterial(tt)) {
     case df::tiletype_material::MINERAL:    return get_vein_mat(block, tx, ty);
@@ -757,12 +779,9 @@ static void process_viewport(df::graphic_viewportst *vp,
             // Tint dug/carved stone surfaces: open floors plus mined
             // ramps and stairs. Walls and Open shapes don't draw a
             // floor sprite — skip them.
+            if (!isFloorTerrain(*tt) && !isRampTerrain(*tt) &&
+                !isStairTerrain(*tt)) continue;
             auto shape = tileShapeBasic(tileShape(*tt));
-            bool is_floor_like =
-                shape == df::tiletype_shape_basic::Floor ||
-                shape == df::tiletype_shape_basic::Ramp ||
-                shape == df::tiletype_shape_basic::Stair;
-            if (!is_floor_like) continue;
             // Stone-like materials get base-sprite tinting. Other
             // floor surfaces (constructions, fungus, moss, grass)
             // keep their own appearance but still need rough-edge
@@ -886,20 +905,20 @@ IMPLEMENT_VMETHOD_INTERPOSE(cavern_colors_hook, render);
 // gps->screen byte buffer is also sampled at one screen-tile inside the
 // cell's footprint just to confirm whether that path carries per-map-cell
 // color data or is unused in graphics mode.
-static command_result sample_cell(color_ostream &out,
-                                  std::vector<std::string> &params) {
+//
+// Lua-callable. wx<0 means "use the mouse position"; otherwise (wx, wy, wz)
+// is the explicit world coord to sample.
+static void sample_cell(color_ostream &out, int wx, int wy, int wz) {
     if (!gps || !world || !window_x || !window_y || !window_z) {
         out.printerr("globals not available\n");
-        return CR_FAILURE;
+        return;
     }
 
     df::coord world_pos;
-    if (params.size() >= 3) {
-        // explicit world coords: sample-cell <wx> <wy>   (z = current)
-        world_pos.x = std::atoi(params[1].c_str());
-        world_pos.y = std::atoi(params[2].c_str());
-        world_pos.z = params.size() >= 4 ? std::atoi(params[3].c_str())
-                                         : *window_z;
+    if (wx >= 0) {
+        world_pos.x = wx;
+        world_pos.y = wy;
+        world_pos.z = wz;
     } else {
         world_pos = Gui::getMousePos(true);
         if (!world_pos.isValid()) {
@@ -907,7 +926,7 @@ static command_result sample_cell(color_ostream &out,
                          "cursor over the cell you want, or pass world "
                          "coords: cavern-colors sample-cell <wx> <wy> "
                          "[<wz>]\n");
-            return CR_WRONG_USAGE;
+            return;
         }
     }
     out.print("Sampling world=({},{},{})\n",
@@ -917,7 +936,7 @@ static command_result sample_cell(color_ostream &out,
     auto *vp = gps->main_viewport;
     if (!vp) {
         out.printerr("main_viewport not available\n");
-        return CR_FAILURE;
+        return;
     }
     int vx = world_pos.x - *window_x;
     int vy = world_pos.y - *window_y;
@@ -928,7 +947,7 @@ static command_result sample_cell(color_ostream &out,
               vx, vy, in_vp ? "yes" : "no", gps->viewport_zoom_factor);
     if (!in_vp) {
         out.print("  (cell isn't currently in the viewport)\n");
-        return CR_OK;
+        return;
     }
 
     // Viewport texpos arrays at vp_idx.
@@ -999,7 +1018,7 @@ static command_result sample_cell(color_ostream &out,
     df::tiletype *tt = Maps::getTileType(world_pos);
     if (!tt) {
         out.print("  (no tile type)\n");
-        return CR_OK;
+        return;
     }
     out.print("  tile shape:    {}\n",
               ENUM_KEY_STR(tiletype_shape, tileShape(*tt)));
@@ -1007,7 +1026,7 @@ static command_result sample_cell(color_ostream &out,
               ENUM_KEY_STR(tiletype_material, tileMaterial(*tt)));
     df::map_block *block = Maps::getTileBlock(world_pos.x, world_pos.y,
                                               world_pos.z);
-    if (!block) return CR_OK;
+    if (!block) return;
     int tx = world_pos.x & 15, ty = world_pos.y & 15;
     auto &dsgn = block->designation[tx][ty];
 
@@ -1064,7 +1083,6 @@ static command_result sample_cell(color_ostream &out,
     } else {
         out.print("  get_tile_mat -> (unresolved)\n");
     }
-    return CR_OK;
 }
 
 
@@ -1074,31 +1092,25 @@ static command_result sample_cell(color_ostream &out,
 // (and friends) without saving to disk: a small distinct-color count plus a
 // recognizable palette tells us at a glance whether the texture is a per-
 // material tinted overlay vs. some other kind of sprite.
-static command_result dump_texture(color_ostream &out,
-                                   std::vector<std::string> &params) {
-    if (params.size() < 2) {
-        out.printerr("Usage: cavern-colors dump-texture <texpos>\n");
-        return CR_WRONG_USAGE;
-    }
+static void dump_texture(color_ostream &out, int texpos) {
     if (!enabler) {
         out.printerr("enabler not available\n");
-        return CR_FAILURE;
+        return;
     }
-    int32_t texpos = std::atoi(params[1].c_str());
     if (texpos <= 0 ||
         (size_t)texpos >= enabler->textures.raws.size()) {
         out.printerr("texpos {} out of range\n", texpos);
-        return CR_FAILURE;
+        return;
     }
     SDL_Surface *src = (SDL_Surface *)enabler->textures.raws[texpos];
     if (!src) {
         out.printerr("no surface at texpos {}\n", texpos);
-        return CR_FAILURE;
+        return;
     }
     SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
-    if (!fmt) return CR_FAILURE;
+    if (!fmt) return;
     SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
-    if (!conv) return CR_FAILURE;
+    if (!conv) return;
     int w = conv->w, h = conv->h;
     std::unordered_map<uint32_t, int> hist;
     for (int y = 0; y < h; y++) {
@@ -1134,152 +1146,128 @@ static command_result dump_texture(color_ostream &out,
                   (int)(c & 0xff), (int)((c >> 8) & 0xff),
                   (int)((c >> 16) & 0xff), (int)((c >> 24) & 0xff));
     }
-    return CR_OK;
 }
 
 // ---------------------------------------------------------------------------
+// Lua API: argument parsing and dispatch live in plugins/lua/cavern-colors.lua;
+// these are the typed setters and queries it calls into.
+
+static void print_status(color_ostream &out) {
+    out.print("Current mode:     {}\n", mode_name(color_mode));
+    out.print("Brightness boost: {}\n", brightness_boost);
+    out.print("Tint strength:    {}\n", tint_strength);
+    out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
+    auto dir_label = [](const directional_overlay &o) {
+        if (!o.valid) return std::string("-");
+        // source_texpos here holds the floors.png cell id we stamped at
+        // load: col*100 + row (1-based).
+        int col = o.source_texpos / 100;
+        int row = o.source_texpos % 100;
+        return fmt::format("c{}r{}", col, row);
+    };
+    out.print("Rough edges:      {} "
+              "({} composite(s) cached, fringes "
+              "S:{} W:{} E:{} N:{} "
+              "NE:{} SE:{} SW:{} NW:{})\n",
+              rough_edges_enabled ? "on" : "off",
+              composite_cache.size(),
+              dir_label(overlay_by_dir[0]),
+              dir_label(overlay_by_dir[1]),
+              dir_label(overlay_by_dir[2]),
+              dir_label(overlay_by_dir[3]),
+              dir_label(overlay_by_dir[4]),
+              dir_label(overlay_by_dir[5]),
+              dir_label(overlay_by_dir[6]),
+              dir_label(overlay_by_dir[7]));
+    out.print("Z-fog tinting:    {}\n", z_fog_enabled ? "on" : "off");
+}
+
+// Returns true on success. Lua side validates the string against the allowed
+// names before calling, so an unknown value here is a programming bug.
+static bool set_mode(color_ostream &out, std::string name) {
+    ColorMode new_mode;
+    if      (name == "hybrid")      new_mode = ColorMode::hybrid;
+    else if (name == "mat_rgb")     new_mode = ColorMode::mat_rgb;
+    else if (name == "basic_color") new_mode = ColorMode::basic_color;
+    else {
+        out.printerr("Unknown mode '{}'\n", name);
+        return false;
+    }
+    if (new_mode != color_mode) {
+        color_mode = new_mode;
+        clear_tinted_cache();
+        clear_composite_cache();
+        build_material_tints();
+        out.print("cavern-colors mode set to '{}'\n", name);
+    }
+    return true;
+}
+
+static void set_boost(color_ostream &out, double v) {
+    brightness_boost = (float)std::max(v, 0.0);
+    clear_tinted_cache();
+    clear_composite_cache();
+    out.print("cavern-colors brightness boost set to {}\n", brightness_boost);
+}
+
+static void set_strength(color_ostream &out, double v) {
+    tint_strength = (float)std::clamp(v, 0.0, 1.0);
+    clear_tinted_cache();
+    clear_composite_cache();
+    out.print("cavern-colors tint strength set to {}\n", tint_strength);
+}
+
+static void set_rough_edges(color_ostream &out, bool on) {
+    rough_edges_enabled = on;
+    if (!on) {
+        clear_composite_cache();
+        out.print("rough-edge tinting: off "
+                  "(composite cache cleared; rough edges will show DF's "
+                  "default untinted overlay until you scroll past them so "
+                  "DF re-paints)\n");
+    } else {
+        out.print("rough-edge tinting: on\n");
+    }
+}
+
+static void set_z_fog(color_ostream &out, bool on) {
+    z_fog_enabled = on;
+    out.print("z-fog tinting: {}\n", on ? "on" : "off");
+}
+
+DFHACK_PLUGIN_LUA_FUNCTIONS {
+    DFHACK_LUA_FUNCTION(print_status),
+    DFHACK_LUA_FUNCTION(set_mode),
+    DFHACK_LUA_FUNCTION(set_boost),
+    DFHACK_LUA_FUNCTION(set_strength),
+    DFHACK_LUA_FUNCTION(set_rough_edges),
+    DFHACK_LUA_FUNCTION(set_z_fog),
+    DFHACK_LUA_FUNCTION(sample_cell),
+    DFHACK_LUA_FUNCTION(dump_texture),
+    DFHACK_LUA_END
+};
+
+// ---------------------------------------------------------------------------
 // Plugin lifecycle
+
+static command_result do_command(color_ostream &out,
+                                 std::vector<std::string> &parameters) {
+    bool ok = false;
+    if (!Lua::CallLuaModuleFunction(out, "plugins.cavern-colors",
+            "parse_commandline", std::make_tuple(parameters),
+            1, [&](lua_State *L) { ok = lua_toboolean(L, 1); })) {
+        return CR_FAILURE;
+    }
+    return ok ? CR_OK : CR_WRONG_USAGE;
+}
 
 DFhackCExport command_result plugin_init(color_ostream &out,
                                          std::vector<PluginCommand> &commands)
 {
     commands.push_back(PluginCommand(
-        "cavern-colors",
+        plugin_name,
         "Restore per-mineral floor colors in premium graphics mode.",
-        [](color_ostream &out, std::vector<std::string> &params) -> command_result {
-            if (params.empty()) {
-                out.print("Usage: cavern-colors mode <hybrid|mat_rgb|basic_color>\n");
-                out.print("         hybrid      = mat_rgb when the material has one, else basic_color\n");
-                out.print("         mat_rgb     = modern premium float RGB only (uncolored if unset)\n");
-                out.print("         basic_color = legacy 16-color CGA palette (always available)\n");
-                out.print("       cavern-colors boost <float>      (brightness multiplier, default 2.0)\n");
-                out.print("       cavern-colors strength <0..1>    (tint saturation, default 0.8)\n");
-                out.print("       cavern-colors enable|disable\n");
-                out.print("       cavern-colors rough-edges on|off (rough-edge bleed tinting; default on)\n");
-                out.print("       cavern-colors z-fog on|off       (tint sprites showing through from below; default on)\n");
-                out.print("       cavern-colors sample-cell [<wx> <wy> [<wz>]]   (default: mouse pos)\n");
-                out.print("       cavern-colors dump-texture <texpos>\n");
-                out.print("Current mode:     {}\n", mode_name(color_mode));
-                out.print("Brightness boost: {}\n", brightness_boost);
-                out.print("Tint strength:    {}\n", tint_strength);
-                out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
-                auto dir_label = [](const directional_overlay &o) {
-                    if (!o.valid) return std::string("-");
-                    // source_texpos here holds the floors.png cell id
-                    // we stamped at load: col*100 + row (1-based).
-                    int col = o.source_texpos / 100;
-                    int row = o.source_texpos % 100;
-                    return fmt::format("c{}r{}", col, row);
-                };
-                out.print("Rough edges:      {} "
-                          "({} composite(s) cached, fringes "
-                          "S:{} W:{} E:{} N:{} "
-                          "NE:{} SE:{} SW:{} NW:{})\n",
-                          rough_edges_enabled ? "on" : "off",
-                          composite_cache.size(),
-                          dir_label(overlay_by_dir[0]),
-                          dir_label(overlay_by_dir[1]),
-                          dir_label(overlay_by_dir[2]),
-                          dir_label(overlay_by_dir[3]),
-                          dir_label(overlay_by_dir[4]),
-                          dir_label(overlay_by_dir[5]),
-                          dir_label(overlay_by_dir[6]),
-                          dir_label(overlay_by_dir[7]));
-                out.print("Z-fog tinting:    {}\n",
-                          z_fog_enabled ? "on" : "off");
-                return CR_OK;
-            }
-
-            if (params[0] == "enable" || params[0] == "disable") {
-                bool want = (params[0] == "enable");
-                return Core::getInstance().runCommand(out,
-                    want ? "enable cavern-colors" : "disable cavern-colors");
-            }
-
-            if (params[0] == "mode" && params.size() >= 2) {
-                ColorMode new_mode;
-                if      (params[1] == "hybrid")      new_mode = ColorMode::hybrid;
-                else if (params[1] == "mat_rgb")     new_mode = ColorMode::mat_rgb;
-                else if (params[1] == "basic_color") new_mode = ColorMode::basic_color;
-                else {
-                    out.printerr("Unknown mode '{}'. Use: hybrid, mat_rgb, basic_color\n",
-                                 params[1]);
-                    return CR_WRONG_USAGE;
-                }
-                if (new_mode != color_mode) {
-                    color_mode = new_mode;
-                    clear_tinted_cache();
-                    clear_composite_cache();
-                    build_material_tints();
-                    out.print("cavern-colors mode set to '{}'\n", params[1]);
-                }
-                return CR_OK;
-            }
-
-            if ((params[0] == "boost" || params[0] == "strength") && params.size() >= 2) {
-                char *end = nullptr;
-                float v = strtof(params[1].c_str(), &end);
-                if (end == params[1].c_str() || !std::isfinite(v) || v < 0.0f) {
-                    out.printerr("Expected a non-negative number, got '{}'\n", params[1]);
-                    return CR_WRONG_USAGE;
-                }
-                if (params[0] == "boost") {
-                    brightness_boost = v;
-                    out.print("cavern-colors brightness boost set to {}\n", v);
-                } else {
-                    tint_strength = std::clamp(v, 0.0f, 1.0f);
-                    out.print("cavern-colors tint strength set to {}\n", tint_strength);
-                }
-                clear_tinted_cache();
-                clear_composite_cache();
-                return CR_OK;
-            }
-
-            if (params[0] == "z-fog" && params.size() >= 2) {
-                if (params[1] == "on") {
-                    z_fog_enabled = true;
-                    out.print("z-fog tinting: on\n");
-                } else if (params[1] == "off") {
-                    z_fog_enabled = false;
-                    out.print("z-fog tinting: off\n");
-                } else {
-                    out.printerr("Expected 'on' or 'off'\n");
-                    return CR_WRONG_USAGE;
-                }
-                return CR_OK;
-            }
-
-            if (params[0] == "rough-edges" && params.size() >= 2) {
-                if (params[1] == "on") {
-                    rough_edges_enabled = true;
-                    out.print("rough-edge tinting: on\n");
-                } else if (params[1] == "off") {
-                    rough_edges_enabled = false;
-                    clear_composite_cache();
-                    out.print("rough-edge tinting: off "
-                              "(composite cache cleared; rough edges will "
-                              "show DF's default untinted overlay until you "
-                              "scroll past them so DF re-paints)\n");
-                } else {
-                    out.printerr("Expected 'on' or 'off'\n");
-                    return CR_WRONG_USAGE;
-                }
-                return CR_OK;
-            }
-
-            if (params[0] == "sample-cell") {
-                return sample_cell(out, params);
-            }
-
-            if (params[0] == "dump-texture") {
-                return dump_texture(out, params);
-            }
-
-            out.printerr("Unknown argument '{}'\n", params[0]);
-            return CR_WRONG_USAGE;
-        }
-    ));
-
+        do_command));
     return CR_OK;
 }
 
