@@ -398,9 +398,10 @@ static void snapshot_overlays() {
         DFSDL_FreeSurface(conv);
         n++;
     }
-    INFO(log).print(
-        "snapshotted {} boulder overlay sprite(s) from a table of {}\n",
-        n, table.size());
+    color_ostream_proxy c(Core::getInstance().getConsole());
+    c.print("[cavern-colors] snapshotted {} boulder overlay sprite(s) "
+            "from a table of {}\n",
+            n, table.size());
 }
 
 static void clear_composite_cache();
@@ -1954,9 +1955,18 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("Brightness boost: {}\n", brightness_boost);
                 out.print("Tint strength:    {}\n", tint_strength);
                 out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
-                out.print("Leak tinting:     {} ({} composite(s) cached)\n",
-                         leaks_enabled ? "on" : "off",
-                         composite_cache.size());
+                {
+                    int populated = 0;
+                    for (auto &s : overlay_snapshots)
+                        if (!s.pixels.empty()) populated++;
+                    out.print("Leak tinting:     {} ({} composite(s) cached, "
+                              "{}/{} overlay snapshot(s) populated, "
+                              "last table size {})\n",
+                              leaks_enabled ? "on" : "off",
+                              composite_cache.size(),
+                              populated, (int)overlay_snapshots.size(),
+                              overlay_snapshot_table_size);
+                }
                 out.print("Collecting walls: {} ({} mat(s) base / "
                          "{} mat(s) overlay)\n",
                          collect_walls ? "yes" : "no",
