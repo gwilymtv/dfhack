@@ -1719,6 +1719,64 @@ static command_result dump_texture(color_ostream &out,
 }
 
 // ---------------------------------------------------------------------------
+// Debug: print the alpha mask of a sprite as a 32×32 ASCII grid. Used to
+// see where opaque/translucent pixels are positioned in the sprite — vital
+// for matching DF's overlay orientation when histograms can't tell us
+// position. Glyph levels: ' '=fully transparent, '.'=alpha<64,
+// ':'=alpha<128, 'o'=alpha<192, '#'=alpha 192+.
+static command_result mask_texture(color_ostream &out,
+                                   std::vector<std::string> &params) {
+    if (params.size() < 2) {
+        out.printerr("Usage: cavern-colors mask-texture <texpos>\n");
+        return CR_WRONG_USAGE;
+    }
+    if (!enabler) {
+        out.printerr("enabler not available\n");
+        return CR_FAILURE;
+    }
+    int32_t texpos = std::atoi(params[1].c_str());
+    if (texpos <= 0 ||
+        (size_t)texpos >= enabler->textures.raws.size()) {
+        out.printerr("texpos {} out of range\n", texpos);
+        return CR_FAILURE;
+    }
+    SDL_Surface *src = (SDL_Surface *)enabler->textures.raws[texpos];
+    if (!src) {
+        out.printerr("no surface at texpos {}\n", texpos);
+        return CR_FAILURE;
+    }
+    SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
+    if (!fmt) {
+        out.printerr("could not alloc RGBA32 format\n");
+        return CR_FAILURE;
+    }
+    SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
+    if (!conv) {
+        out.printerr("could not convert surface\n");
+        return CR_FAILURE;
+    }
+    int w = conv->w, h = conv->h;
+    out.print("texpos {} alpha mask ({}x{}):\n", texpos, w, h);
+    for (int y = 0; y < h; y++) {
+        std::string line = "  ";
+        uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t a = row[x * 4 + 3];
+            char c = ' ';
+            if (a == 0)         c = ' ';
+            else if (a < 64)    c = '.';
+            else if (a < 128)   c = ':';
+            else if (a < 192)   c = 'o';
+            else                c = '#';
+            line += c;
+        }
+        out.print("{}\n", line);
+    }
+    DFSDL_FreeSurface(conv);
+    return CR_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Debug: rewrite every opaque pixel of the SDL_Surface backing the given
 // texpos to solid red, in place. Used to test whether DF's renderer actually
 // re-reads pixel data from enabler->textures.raws on each frame (so an
@@ -1980,6 +2038,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("       cavern-colors dump-cache\n");
                 out.print("       cavern-colors sample-cell [<wx> <wy> [<wz>]]   (default: mouse pos)\n");
                 out.print("       cavern-colors dump-texture <texpos>\n");
+                out.print("       cavern-colors mask-texture <texpos>\n");
                 out.print("       cavern-colors paint-overlay <texpos>\n");
                 out.print("       cavern-colors extract-palette\n");
                 out.print("       cavern-colors dump-wall-graphics\n");
@@ -2113,6 +2172,10 @@ DFhackCExport command_result plugin_init(color_ostream &out,
 
             if (params[0] == "dump-texture") {
                 return dump_texture(out, params);
+            }
+
+            if (params[0] == "mask-texture") {
+                return mask_texture(out, params);
             }
 
             if (params[0] == "paint-overlay") {
