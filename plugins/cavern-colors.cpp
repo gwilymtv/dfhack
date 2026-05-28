@@ -403,6 +403,8 @@ static void snapshot_overlays() {
         n, table.size());
 }
 
+static void clear_composite_cache();
+
 // Re-snapshot if the table has grown since the last snapshot. Called from
 // the render hook so we pick up overlays DF populates lazily.
 static void maybe_resnapshot_overlays() {
