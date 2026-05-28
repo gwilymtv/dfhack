@@ -322,36 +322,33 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 
 static bool leaks_enabled = true;
 
-// Snapshot of one wall_graphics_info entry: pixels (RGBA32), original
-// flag and texpos preserved for lookup and debugging.
-struct overlay_snapshot {
+// One canonical overlay sprite per cardinal direction (RGBA32). We
+// classify wall_graphics_info entries by alpha-weighted pixel centroid
+// rather than by flag bits: the flag-bits hypothesis turned out wrong
+// (different "side" bit values pointed at identical sprites, and at
+// L-shaped combined sprites that don't match a single edge). Centroid
+// classification works on observed pixel positions directly.
+struct directional_overlay {
+    bool valid = false;
     int w = 0, h = 0;
     std::vector<uint32_t> pixels;
-    uint64_t flag = 0;
-    int32_t texpos = 0;
+    int32_t source_texpos = 0; // for diagnostics
 };
-static std::vector<overlay_snapshot> overlay_snapshots;
-// (side << 8) | byte_value → first matching snapshot index. Same key
-// shape DF uses to look up an entry from the cell's floor_flag.
-static std::unordered_map<int, int> overlay_lookup;
+// Indexed by ROUGH_SIDES position: 0=S, 1=W, 2=E, 3=N.
+static std::array<directional_overlay, 4> overlay_by_dir;
 // Last observed size of wall_graphics_info. DF populates the table at
 // world-load but we re-check each frame in case it grows.
 static size_t overlay_snapshot_table_size = 0;
 
 struct rough_side_info {
     int dx, dy;
-    int byte_offset;       // floor_flag byte index
-    int wall_graphics_side; // wall_graphics_info flag bits 20-23 value
+    int byte_offset; // floor_flag byte index
 };
-// Mapping hypothesis: wall_graphics_info side bits 20-23 use same order
-// as our floor_flag bytes (0=S, 1=W, 2=E, 3=N). If leak shapes appear
-// mirrored or rotated when this lands, permute the wall_graphics_side
-// field below.
 static const std::array<rough_side_info, 4> ROUGH_SIDES = {{
-    { 0, +1, 0, 0}, // S
-    {-1,  0, 1, 1}, // W
-    {+1,  0, 2, 2}, // E
-    { 0, -1, 3, 3}, // N
+    { 0, +1, 0}, // S (byte 0)
+    {-1,  0, 1}, // W (byte 1)
+    {+1,  0, 2}, // E (byte 2)
+    { 0, -1, 3}, // N (byte 3)
 }};
 
 // Composite cache key. (base_texpos, floor_flag, per-side rough neighbour
@@ -386,15 +383,66 @@ struct composite_key_hash {
 static std::unordered_map<composite_key, TexposHandle, composite_key_hash>
     composite_cache;
 
+// Classify a 32×32 RGBA sprite into a cardinal direction by alpha-weighted
+// centroid. Returns -1 if the sprite isn't a good directional fragment
+// (e.g., too opaque, centroid too central, or too few opaque pixels).
+static int classify_overlay_direction(const std::vector<uint32_t> &pixels,
+                                      int w, int h) {
+    if (w != 32 || h != 32) return -1;
+    int n_transp = 0;
+    double sum_x = 0, sum_y = 0, sum_w = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            uint32_t px = pixels[(size_t)y * w + x];
+            uint8_t a = (px >> 24) & 0xff;
+            if (a == 0) { n_transp++; continue; }
+            sum_x += x * a;
+            sum_y += y * a;
+            sum_w += a;
+        }
+    }
+    if (sum_w < 200) return -1; // too few opaque pixels
+    // Skip dense sprites (full walls). Edge fragments are >=30% transparent.
+    if (n_transp < (w * h * 30) / 100) return -1;
+    double cx = sum_x / sum_w;
+    double cy = sum_y / sum_w;
+    // Side: pick the dominant axis from the centre.
+    double dx = cx - (w - 1) / 2.0;
+    double dy = cy - (h - 1) / 2.0;
+    if (std::abs(dx) < 3.0 && std::abs(dy) < 3.0) return -1; // too central
+    if (std::abs(dx) > std::abs(dy)) {
+        return dx < 0 ? 1 /* W */ : 2 /* E */;
+    } else {
+        return dy < 0 ? 3 /* N */ : 0 /* S */;
+    }
+}
+
+// Mirror a 32×32 RGBA sprite horizontally (left/right) and vertically.
+static std::vector<uint32_t>
+mirror_h(const std::vector<uint32_t> &src, int w, int h) {
+    std::vector<uint32_t> dst(src.size());
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            dst[(size_t)y * w + x] = src[(size_t)y * w + (w - 1 - x)];
+    return dst;
+}
+static std::vector<uint32_t>
+mirror_v(const std::vector<uint32_t> &src, int w, int h) {
+    std::vector<uint32_t> dst(src.size());
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            dst[(size_t)y * w + x] = src[(size_t)(h - 1 - y) * w + x];
+    return dst;
+}
+
 static void snapshot_overlays() {
-    overlay_snapshots.clear();
-    overlay_lookup.clear();
+    for (auto &o : overlay_by_dir) o = {};
     overlay_snapshot_table_size = 0;
     if (!world || !enabler) return;
     auto &table = world->raws.descriptors.wall_graphics_info;
     overlay_snapshot_table_size = table.size();
-    overlay_snapshots.reserve(table.size());
-    int n = 0;
+    int n_examined = 0, n_classified = 0;
+    int per_dir[4] = {0, 0, 0, 0};
     for (auto *info : table) {
         if (!info) continue;
         if (info->texpos <= 0 ||
@@ -406,33 +454,60 @@ static void snapshot_overlays() {
         if (!fmt) continue;
         SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
         if (!conv) continue;
-        overlay_snapshot snap;
-        snap.w = conv->w;
-        snap.h = conv->h;
-        snap.flag = info->flags.whole;
-        snap.texpos = info->texpos;
-        snap.pixels.assign((size_t)snap.w * snap.h, 0);
-        for (int y = 0; y < snap.h; y++) {
+        int w = conv->w, h = conv->h;
+        std::vector<uint32_t> pixels((size_t)w * h);
+        for (int y = 0; y < h; y++) {
             uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
-            memcpy(&snap.pixels[(size_t)y * snap.w], row, (size_t)snap.w * 4);
+            memcpy(&pixels[(size_t)y * w], row, (size_t)w * 4);
         }
         DFSDL_FreeSurface(conv);
-        // Index by (side bits 20-23, low byte). First match wins; the
-        // table commonly has multiple variants per key, and we have no
-        // signal for picking among them, so deterministically pick the
-        // first encountered.
-        int side = (int)((snap.flag >> 20) & 0xf);
-        int byte_value = (int)(snap.flag & 0xff);
-        int key = (side << 8) | byte_value;
-        if (!overlay_lookup.count(key))
-            overlay_lookup[key] = (int)overlay_snapshots.size();
-        overlay_snapshots.push_back(std::move(snap));
-        n++;
+        n_examined++;
+        int dir = classify_overlay_direction(pixels, w, h);
+        if (dir < 0) continue;
+        per_dir[dir]++;
+        // First good fragment per direction wins. Could refine later by
+        // ranking on opacity profile, but in practice the first-seen
+        // edge fragment is usually a clean variant.
+        if (!overlay_by_dir[dir].valid) {
+            overlay_by_dir[dir].valid = true;
+            overlay_by_dir[dir].w = w;
+            overlay_by_dir[dir].h = h;
+            overlay_by_dir[dir].pixels = std::move(pixels);
+            overlay_by_dir[dir].source_texpos = info->texpos;
+            n_classified++;
+        }
     }
+    // Backfill missing directions by mirroring from the populated ones:
+    //   W ↔ E (horizontal mirror)
+    //   N ↔ S (vertical mirror)
+    auto backfill = [](int dst, int src, bool horizontal) {
+        if (overlay_by_dir[dst].valid) return;
+        if (!overlay_by_dir[src].valid) return;
+        overlay_by_dir[dst] = overlay_by_dir[src];
+        if (horizontal)
+            overlay_by_dir[dst].pixels =
+                mirror_h(overlay_by_dir[src].pixels,
+                         overlay_by_dir[src].w, overlay_by_dir[src].h);
+        else
+            overlay_by_dir[dst].pixels =
+                mirror_v(overlay_by_dir[src].pixels,
+                         overlay_by_dir[src].w, overlay_by_dir[src].h);
+    };
+    backfill(2, 1, true);  // E ← mirror W
+    backfill(1, 2, true);  // W ← mirror E
+    backfill(3, 0, false); // N ← mirror S
+    backfill(0, 3, false); // S ← mirror N
+
     color_ostream_proxy c(Core::getInstance().getConsole());
-    c.print("[cavern-colors] snapshotted {} wall overlay sprite(s) "
-            "from a table of {} ({} unique (side, byte) key(s))\n",
-            n, table.size(), overlay_lookup.size());
+    c.print("[cavern-colors] snapshotted overlays from wall_graphics_info "
+            "({} entries examined, {} classified; per-dir S:{} W:{} E:{} "
+            "N:{}); after mirror-backfill: S:{} W:{} E:{} N:{}\n",
+            n_examined, n_classified,
+            per_dir[0], per_dir[1], per_dir[2], per_dir[3],
+            overlay_by_dir[0].valid ? "ok" : "-",
+            overlay_by_dir[1].valid ? "ok" : "-",
+            overlay_by_dir[2].valid ? "ok" : "-",
+            overlay_by_dir[3].valid ? "ok" : "-");
 }
 
 static void clear_composite_cache();
@@ -1104,17 +1179,13 @@ static TexposHandle make_composite(const composite_key &key) {
         int byte_value = (int)((key.floor_flag >>
                                 (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
         if (!(byte_value & 0x08)) continue;
-        int lookup_key =
-            (ROUGH_SIDES[i].wall_graphics_side << 8) | byte_value;
-        auto it = overlay_lookup.find(lookup_key);
-        if (it == overlay_lookup.end()) continue;
-        const auto &snap = overlay_snapshots[it->second];
-        if (snap.pixels.empty()) continue;
-        if (snap.w != w || snap.h != h) continue;
+        const auto &dir_overlay = overlay_by_dir[i];
+        if (!dir_overlay.valid) continue;
+        if (dir_overlay.w != w || dir_overlay.h != h) continue;
         int16_t mat = side_mats[i];
         if (mat < 0) continue;
-        for (size_t p = 0; p < snap.pixels.size(); p++) {
-            uint32_t ov = retint_overlay_pixel(snap.pixels[p], mat);
+        for (size_t p = 0; p < dir_overlay.pixels.size(); p++) {
+            uint32_t ov = retint_overlay_pixel(dir_overlay.pixels[p], mat);
             uint8_t oa = (ov >> 24) & 0xff;
             if (oa == 0) continue;
             uint32_t base = pixels[p];
@@ -1311,11 +1382,11 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                     shape == df::tiletype_shape_basic::Floor &&
                     vp->screentexpos_floor_flag) {
                     // Only take the composite path if we have at least one
-                    // overlay snapshot to use; otherwise the composite would
+                    // directional overlay; otherwise the composite would
                     // strip DF's own leak draw and replace it with nothing.
                     bool have_any = false;
-                    for (auto &s : overlay_snapshots)
-                        if (!s.pixels.empty()) { have_any = true; break; }
+                    for (auto &o : overlay_by_dir)
+                        if (o.valid) { have_any = true; break; }
                     if (have_any)
                         flag = vp->screentexpos_floor_flag[idx];
                 }
@@ -2047,15 +2118,19 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("Brightness boost: {}\n", brightness_boost);
                 out.print("Tint strength:    {}\n", tint_strength);
                 out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
+                auto dir_label = [](const directional_overlay &o) {
+                    if (!o.valid) return std::string("-");
+                    return std::to_string(o.source_texpos);
+                };
                 out.print("Leak tinting:     {} "
-                          "({} composite(s) cached, "
-                          "{} overlay snapshot(s), "
-                          "{} (side, byte) lookup key(s), "
-                          "last table size {})\n",
+                          "({} composite(s) cached, dir overlays "
+                          "S:{} W:{} E:{} N:{}, last table size {})\n",
                           leaks_enabled ? "on" : "off",
                           composite_cache.size(),
-                          overlay_snapshots.size(),
-                          overlay_lookup.size(),
+                          dir_label(overlay_by_dir[0]),
+                          dir_label(overlay_by_dir[1]),
+                          dir_label(overlay_by_dir[2]),
+                          dir_label(overlay_by_dir[3]),
                           overlay_snapshot_table_size);
                 out.print("Collecting walls: {} ({} mat(s) base / "
                          "{} mat(s) overlay)\n",
@@ -2231,8 +2306,7 @@ DFhackCExport void plugin_onstatechange(color_ostream &out, state_change_event e
         wall_overlay_texposes_by_mat.clear();
         palette_by_mat.clear();
         observed_overlays.clear();
-        overlay_snapshots.clear();
-        overlay_lookup.clear();
+        for (auto &o : overlay_by_dir) o = {};
         overlay_snapshot_table_size = 0;
         break;
     default:
