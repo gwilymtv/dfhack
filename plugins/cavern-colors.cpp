@@ -1862,6 +1862,71 @@ static command_result mask_texture(color_ostream &out,
 }
 
 // ---------------------------------------------------------------------------
+// Debug: iterate every wall_graphics_info entry and print the per-sprite
+// stats we use to classify fringes — transparent/translucent/opaque pixel
+// counts, opaque bounding box, and whether it currently passes the
+// classifier. Helps locate the real fringe sprites in the table and tune
+// the classifier thresholds. Output is filtered to entries that have at
+// least *some* opacity (skips entries that are entirely transparent or
+// out-of-range).
+static command_result classify_overlays(color_ostream &out) {
+    if (!world || !enabler) {
+        out.printerr("world/enabler not available\n");
+        return CR_FAILURE;
+    }
+    auto &table = world->raws.descriptors.wall_graphics_info;
+    out.print("{:>4}  {:>7}  {:>5}  {:>5}  {:>5}  {:>3}x{:<3}  cls\n",
+              "idx", "texpos", "trans", "tlucnt", "opaque", "bw", "bh");
+    int n_classified = 0;
+    int per_dir[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < table.size(); i++) {
+        auto *info = table[i];
+        if (!info) continue;
+        if (info->texpos <= 0 ||
+            (size_t)info->texpos >= enabler->textures.raws.size()) continue;
+        SDL_Surface *src =
+            (SDL_Surface *)enabler->textures.raws[info->texpos];
+        if (!src) continue;
+        SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
+        if (!fmt) continue;
+        SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
+        if (!conv) continue;
+        int w = conv->w, h = conv->h;
+        int n_transp = 0, n_translucent = 0, n_opaque = 0;
+        int min_x = w, min_y = h, max_x = -1, max_y = -1;
+        std::vector<uint32_t> pixels((size_t)w * h);
+        for (int y = 0; y < h; y++) {
+            uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
+            memcpy(&pixels[(size_t)y * w], row, (size_t)w * 4);
+            for (int x = 0; x < w; x++) {
+                uint8_t a = row[x * 4 + 3];
+                if (a == 0) { n_transp++; continue; }
+                if (a == 255) n_opaque++; else n_translucent++;
+                if (x < min_x) min_x = x;
+                if (y < min_y) min_y = y;
+                if (x > max_x) max_x = x;
+                if (y > max_y) max_y = y;
+            }
+        }
+        DFSDL_FreeSurface(conv);
+        if (max_x < 0) continue;
+        int bbox_w = max_x - min_x + 1;
+        int bbox_h = max_y - min_y + 1;
+        int dir = classify_overlay_direction(pixels, w, h);
+        const char *cls = "-";
+        if (dir == 0) { cls = "S"; per_dir[0]++; n_classified++; }
+        else if (dir == 1) { cls = "W"; per_dir[1]++; n_classified++; }
+        else if (dir == 2) { cls = "E"; per_dir[2]++; n_classified++; }
+        else if (dir == 3) { cls = "N"; per_dir[3]++; n_classified++; }
+        out.print("{:>4}  {:>7}  {:>5}  {:>5}  {:>5}  {:>3}x{:<3}  {}\n",
+                  i, info->texpos, n_transp, n_translucent, n_opaque,
+                  bbox_w, bbox_h, cls);
+    }
+    out.print("\n{} classified  (S:{} W:{} E:{} N:{})\n",
+              n_classified, per_dir[0], per_dir[1], per_dir[2], per_dir[3]);
+    return CR_OK;
+}
+
 // Debug: rewrite every opaque pixel of the SDL_Surface backing the given
 // texpos to solid red, in place. Used to test whether DF's renderer actually
 // re-reads pixel data from enabler->textures.raws on each frame (so an
@@ -2125,6 +2190,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("       cavern-colors dump-texture <texpos>\n");
                 out.print("       cavern-colors mask-texture <texpos>\n");
                 out.print("       cavern-colors paint-overlay <texpos>\n");
+                out.print("       cavern-colors classify-overlays\n");
                 out.print("       cavern-colors extract-palette\n");
                 out.print("       cavern-colors dump-wall-graphics\n");
                 out.print("       cavern-colors dump-baked\n");
@@ -2269,6 +2335,10 @@ DFhackCExport command_result plugin_init(color_ostream &out,
 
             if (params[0] == "paint-overlay") {
                 return paint_overlay(out, params);
+            }
+
+            if (params[0] == "classify-overlays") {
+                return classify_overlays(out);
             }
 
             if (params[0] == "extract-palette") {
