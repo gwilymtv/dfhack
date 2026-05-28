@@ -1164,25 +1164,42 @@ static TexposHandle make_composite(const composite_key &key) {
         return (byte_value & 0x08) != 0;
     };
 
-    // Corners first (lower layer).
+    // Corners first (lower layer). Only apply a corner if both of its
+    // cardinals resolved to a rough-stone material — a corner spanning
+    // stone + grass shouldn't get our stone-tinted corner sprite, since
+    // DF will draw its own mixed/grass corner naturally on the bytes we
+    // leave intact.
     for (const auto &cn : ROUGH_CORNERS) {
         if (!enabled(cn.cardinal_a) || !enabled(cn.cardinal_b)) continue;
+        if (key.mat[cn.cardinal_a] < 0 || key.mat[cn.cardinal_b] < 0) continue;
         int16_t mat = key.mat[cn.cardinal_a];
-        if (mat < 0) mat = key.mat[cn.cardinal_b];
         blend_overlay(overlay_by_dir[cn.overlay_index], mat);
     }
 
-    // Cardinals second (upper layer).
+    // Cardinals second (upper layer). Only sides that resolved to a
+    // rough-stone material; sides whose neighbour is grass/etc. stay
+    // in floor_flag for DF to render naturally.
     for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
         if (!enabled((int)i)) continue;
+        if (key.mat[i] < 0) continue;
         blend_overlay(overlay_by_dir[i], key.mat[i]);
     }
 
     return Textures::createTile(pixels, w, h, true);
 }
 
+// Resolve a composite for the cell. `out_consumed_mask` returns the
+// floor_flag byte mask of sides we actually composited (each handled
+// side contributes 0xff at its byte offset). Sides whose neighbour
+// isn't a rough-stone tile we recognise stay 0 in the mask — the
+// caller should leave those bytes in floor_flag intact so DF can
+// render its natural overlay (grass leaks, etc.) for them.
+// Returns 0 if no sides resolved — in that case the caller should
+// fall back to plain base-sprite tinting.
 static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
-                                  int wx, int wy, int wz, int base_mat) {
+                                  int wx, int wy, int wz, int base_mat,
+                                  uint64_t &out_consumed_mask) {
+    out_consumed_mask = 0;
     composite_key key{};
     key.base_texpos = base_texpos;
     key.floor_flag = floor_flag;
@@ -1199,9 +1216,13 @@ static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
         df::tiletype *nt = Maps::getTileType(df::coord(nx, ny, wz));
         if (!nt) continue;
         int m = get_tile_mat(nb, nx & 15, ny & 15, *nt);
-        if (m >= 0 && (size_t)m < material_tints.size())
+        if (m >= 0 && (size_t)m < material_tints.size()) {
             key.mat[i] = (int16_t)m;
+            out_consumed_mask |=
+                0xffULL << (ROUGH_SIDES[i].byte_offset * 8);
+        }
     }
+    if (out_consumed_mask == 0) return 0;
 
     auto it = composite_cache.find(key);
     if (it != composite_cache.end()) return it->second;
@@ -1362,23 +1383,31 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                         flag = vp->screentexpos_floor_flag[idx];
                 }
 
+                TexposHandle h = 0;
+                uint64_t consumed = 0;
                 if (flag != 0) {
-                    TexposHandle h = get_composite(src_texpos, flag,
-                                                   wx, wy, wz, mat);
-                    if (!h) continue;
-                    long texpos = Textures::getTexposByHandle(h);
-                    if (texpos > 0) {
-                        vp->screentexpos_background[idx] = (int32_t)texpos;
-                        // Suppress DF's own overlay redraw — the composite
-                        // already bakes in the tinted version.
-                        vp->screentexpos_floor_flag[idx] = 0;
+                    h = get_composite(src_texpos, flag, wx, wy, wz, mat,
+                                      consumed);
+                }
+                if (!h && mat >= 0) {
+                    // No rough-stone sides to composite (or leaks
+                    // disabled). Fall back to plain base tinting so
+                    // DF's natural leak overlays (grass, etc.) keep
+                    // rendering through floor_flag.
+                    h = get_tinted(src_texpos, mat);
+                }
+                if (!h) continue;
+                long texpos = Textures::getTexposByHandle(h);
+                if (texpos > 0) {
+                    vp->screentexpos_background[idx] = (int32_t)texpos;
+                    if (consumed) {
+                        // Suppress DF's own overlay redraw for the
+                        // sides we already baked into the composite.
+                        // Leave other sides' bytes intact so DF can
+                        // still render grass/other natural leaks for
+                        // those sides.
+                        vp->screentexpos_floor_flag[idx] = flag & ~consumed;
                     }
-                } else if (mat >= 0) {
-                    TexposHandle h = get_tinted(src_texpos, mat);
-                    if (!h) continue;
-                    long texpos = Textures::getTexposByHandle(h);
-                    if (texpos > 0)
-                        vp->screentexpos_background[idx] = (int32_t)texpos;
                 }
             }
         }
