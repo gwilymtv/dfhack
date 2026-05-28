@@ -294,6 +294,12 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 
 static bool rough_edges_enabled = true;
 
+// When the cell at the current z is open/empty, DF renders a fogged-down
+// sprite from the deepest visible floor below. By default we mirror DF and
+// walk down z-levels for those cells so the tint follows the sprite that's
+// actually being shown. Disable to restrict tinting to the current z only.
+static bool z_fog_enabled = true;
+
 // One fringe sprite per direction (4 cardinals + 4 diagonals), loaded
 // once from floors.png at world-load. Indexed by ROUGH_SIDES position:
 // 0=S 1=W 2=E 3=N 4=NE 5=SE 6=SW 7=NW.
@@ -724,6 +730,116 @@ static TexposHandle get_composite(int32_t base_texpos, uint64_t floor_flag,
 // ---------------------------------------------------------------------------
 // Render hook
 
+// Tint one viewport's screentexpos arrays at z-level `z`. Used for both
+// gps->main_viewport (at *window_z) and gps->lower_viewport[i] (at z =
+// *window_z - (i+1)), which DF maintains as separate per-z-level
+// graphic_viewportst structs to render depth-fogged sprites from below.
+static void process_viewport(df::graphic_viewportst *vp,
+                             int z,
+                             const std::pair<df::coord2d, df::coord2d> &dims)
+{
+    if (!vp || !vp->screentexpos_background) return;
+
+    for (int y = dims.first.y; y <= dims.second.y; y++) {
+        for (int x = dims.first.x; x <= dims.second.x; x++) {
+            size_t idx = (size_t)(x * vp->dim_y + y);
+            int32_t src_texpos = vp->screentexpos_background[idx];
+            if (src_texpos <= 0) continue;
+
+            int wx = *window_x + x;
+            int wy = *window_y + y;
+            df::coord pos(wx, wy, z);
+
+            if (!Maps::isTileVisible(pos)) continue;
+
+            df::tiletype *tt = Maps::getTileType(pos);
+            if (!tt) continue;
+            // Tint dug/carved stone surfaces: open floors plus mined
+            // ramps and stairs. Walls and Open shapes don't draw a
+            // floor sprite — skip them.
+            auto shape = tileShapeBasic(tileShape(*tt));
+            bool is_floor_like =
+                shape == df::tiletype_shape_basic::Floor ||
+                shape == df::tiletype_shape_basic::Ramp ||
+                shape == df::tiletype_shape_basic::Stair;
+            if (!is_floor_like) continue;
+            // Stone-like materials get base-sprite tinting. Other
+            // floor surfaces (constructions, fungus, moss, grass)
+            // keep their own appearance but still need rough-edge
+            // processing — DF composites rough-edge overlays from
+            // neighbouring rough cavern tiles onto *any* adjacent
+            // floor, regardless of what that floor is made of.
+            auto tile_mat_enum = tileMaterial(*tt);
+            bool is_stone_like =
+                tile_mat_enum == df::tiletype_material::STONE ||
+                tile_mat_enum == df::tiletype_material::MINERAL ||
+                tile_mat_enum == df::tiletype_material::LAVA_STONE;
+
+            df::map_block *block = Maps::getTileBlock(wx, wy, z);
+            if (!block) continue;
+
+            int mat = -1;
+            if (is_stone_like) {
+                mat = get_tile_mat(block, wx & 15, wy & 15, *tt);
+                if (mat < 0 ||
+                    (size_t)mat >= material_tints.size())
+                    mat = -1;
+            }
+
+            // Floor-like (FLOOR/RAMP/STAIR). Two paths:
+            //  - composite: when the cell has rough-edge bits set in
+            //    floor_flag and rough-edge processing is enabled. The
+            //    composite handles both base-mat tint (if any) and the
+            //    per-side overlay re-tinted by the rough neighbour's
+            //    material.
+            //  - plain tint: cell has no rough-edge bits, just tint by
+            //    base material. Skipped when base is non-stone (e.g.
+            //    constructions) since we have no material to tint by.
+            uint64_t flag = 0;
+            if (rough_edges_enabled &&
+                shape == df::tiletype_shape_basic::Floor &&
+                vp->screentexpos_floor_flag) {
+                // Only take the composite path if we have at least one
+                // directional overlay; otherwise the composite would
+                // strip DF's own rough-edge draw and replace it with
+                // nothing.
+                bool have_any = false;
+                for (auto &o : overlay_by_dir)
+                    if (o.valid) { have_any = true; break; }
+                if (have_any)
+                    flag = vp->screentexpos_floor_flag[idx];
+            }
+
+            TexposHandle h = 0;
+            uint64_t consumed = 0;
+            if (flag != 0) {
+                h = get_composite(src_texpos, flag, wx, wy, z, mat,
+                                  consumed);
+            }
+            if (!h && mat >= 0) {
+                // No rough-stone sides to composite (or rough-edges
+                // disabled). Fall back to plain base tinting so
+                // DF's natural bleed overlays (grass, etc.) keep
+                // rendering through floor_flag.
+                h = get_tinted(src_texpos, mat);
+            }
+            if (!h) continue;
+            long texpos = Textures::getTexposByHandle(h);
+            if (texpos > 0) {
+                vp->screentexpos_background[idx] = (int32_t)texpos;
+                if (consumed) {
+                    // Suppress DF's own overlay redraw for the
+                    // sides we already baked into the composite.
+                    // Leave other sides' bytes intact so DF can
+                    // still render grass/other natural bleed for
+                    // those sides.
+                    vp->screentexpos_floor_flag[idx] = flag & ~consumed;
+                }
+            }
+        }
+    }
+}
+
 struct cavern_colors_hook : df::viewscreen_dwarfmodest {
     typedef df::viewscreen_dwarfmodest interpose_base;
 
@@ -734,107 +850,23 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
         if (!gps || !gps->main_viewport) return;
         if (material_tints.empty()) return;
 
-
-        auto *vp = gps->main_viewport;
         auto dims = Gui::getDwarfmodeViewDims().map();
 
-        for (int y = dims.first.y; y <= dims.second.y; y++) {
-            for (int x = dims.first.x; x <= dims.second.x; x++) {
-                size_t idx = (size_t)(x * vp->dim_y + y);
-                int32_t src_texpos = vp->screentexpos_background[idx];
-                if (src_texpos <= 0) continue;
+        // Main viewport: tiles at the current view z.
+        process_viewport(gps->main_viewport, *window_z, dims);
 
-                int wx = *window_x + x;
-                int wy = *window_y + y;
-                int wz = *window_z;
-                df::coord pos(wx, wy, wz);
-
-                if (!Maps::isTileVisible(pos)) continue;
-
-                df::tiletype *tt = Maps::getTileType(pos);
-                if (!tt) continue;
-                // Tint dug/carved stone surfaces: open floors plus mined
-                // ramps and stairs. Walls and Open shapes don't draw a
-                // floor sprite — skip them.
-                auto shape = tileShapeBasic(tileShape(*tt));
-                bool is_floor_like =
-                    shape == df::tiletype_shape_basic::Floor ||
-                    shape == df::tiletype_shape_basic::Ramp ||
-                    shape == df::tiletype_shape_basic::Stair;
-                if (!is_floor_like) continue;
-                // Stone-like materials get base-sprite tinting. Other
-                // floor surfaces (constructions, fungus, moss, grass)
-                // keep their own appearance but still need rough-edge
-                // processing — DF composites rough-edge overlays from
-                // neighbouring rough cavern tiles onto *any* adjacent
-                // floor, regardless of what that floor is made of.
-                auto tile_mat_enum = tileMaterial(*tt);
-                bool is_stone_like =
-                    tile_mat_enum == df::tiletype_material::STONE ||
-                    tile_mat_enum == df::tiletype_material::MINERAL ||
-                    tile_mat_enum == df::tiletype_material::LAVA_STONE;
-
-                df::map_block *block = Maps::getTileBlock(wx, wy, wz);
-                if (!block) continue;
-
-                int mat = -1;
-                if (is_stone_like) {
-                    mat = get_tile_mat(block, wx & 15, wy & 15, *tt);
-                    if (mat < 0 ||
-                        (size_t)mat >= material_tints.size())
-                        mat = -1;
-                }
-
-                // Floor-like (FLOOR/RAMP/STAIR). Two paths:
-                //  - composite: when the cell has rough-edge bits set in
-                //    floor_flag and rough-edge processing is enabled. The
-                //    composite handles both base-mat tint (if any) and the
-                //    per-side overlay re-tinted by the rough neighbour's
-                //    material.
-                //  - plain tint: cell has no rough-edge bits, just tint by
-                //    base material. Skipped when base is non-stone (e.g.
-                //    constructions) since we have no material to tint by.
-                uint64_t flag = 0;
-                if (rough_edges_enabled &&
-                    shape == df::tiletype_shape_basic::Floor &&
-                    vp->screentexpos_floor_flag) {
-                    // Only take the composite path if we have at least one
-                    // directional overlay; otherwise the composite would
-                    // strip DF's own rough-edge draw and replace it with
-                    // nothing.
-                    bool have_any = false;
-                    for (auto &o : overlay_by_dir)
-                        if (o.valid) { have_any = true; break; }
-                    if (have_any)
-                        flag = vp->screentexpos_floor_flag[idx];
-                }
-
-                TexposHandle h = 0;
-                uint64_t consumed = 0;
-                if (flag != 0) {
-                    h = get_composite(src_texpos, flag, wx, wy, wz, mat,
-                                      consumed);
-                }
-                if (!h && mat >= 0) {
-                    // No rough-stone sides to composite (or rough-edges
-                    // disabled). Fall back to plain base tinting so
-                    // DF's natural bleed overlays (grass, etc.) keep
-                    // rendering through floor_flag.
-                    h = get_tinted(src_texpos, mat);
-                }
-                if (!h) continue;
-                long texpos = Textures::getTexposByHandle(h);
-                if (texpos > 0) {
-                    vp->screentexpos_background[idx] = (int32_t)texpos;
-                    if (consumed) {
-                        // Suppress DF's own overlay redraw for the
-                        // sides we already baked into the composite.
-                        // Leave other sides' bytes intact so DF can
-                        // still render grass/other natural bleed for
-                        // those sides.
-                        vp->screentexpos_floor_flag[idx] = flag & ~consumed;
-                    }
-                }
+        // Lower viewports: DF maintains a separate per-z-level
+        // graphic_viewportst for each fogged floor below the current
+        // view, used to render sprites that show through "Open" tiles
+        // at the current z. We tint these too so the depth-fogged
+        // sprites pick up the same per-material colors as the current
+        // z-level. DF's shader applies the depth fog after our texpos
+        // substitution, so the dimming composes naturally.
+        if (z_fog_enabled) {
+            for (int i = 0; i < 8; i++) {
+                df::graphic_viewportst *lvp = gps->lower_viewport[i];
+                if (!lvp) continue;
+                process_viewport(lvp, *window_z - (i + 1), dims);
             }
         }
     }
@@ -918,6 +950,26 @@ static command_result sample_cell(color_ostream &out,
               vp_idx, vp->screentexpos_ramp_flag[vp_idx]);
     out.print("  vp->screentexpos_shadow_flag[{}]     = 0x{:x}\n",
               vp_idx, vp->screentexpos_shadow_flag[vp_idx]);
+
+    // Lower viewports: one per fogged-down z-level. Same vp_idx slot.
+    for (int i = 0; i < 8; i++) {
+        df::graphic_viewportst *lvp = gps->lower_viewport[i];
+        if (!lvp || !lvp->screentexpos_background) {
+            out.print("  lower_viewport[{}] (z-{}): (null)\n", i, i + 1);
+            continue;
+        }
+        size_t lidx = (size_t)vx * lvp->dim_y + vy;
+        out.print("  lower_viewport[{}] (z-{}): bg={} bg2={} "
+                  "tex={} floor_flag=0x{:x} ramp_flag=0x{:x} "
+                  "shadow_flag=0x{:x}\n",
+                  i, i + 1,
+                  lvp->screentexpos_background[lidx],
+                  lvp->screentexpos_background_two[lidx],
+                  lvp->screentexpos[lidx],
+                  lvp->screentexpos_floor_flag[lidx],
+                  lvp->screentexpos_ramp_flag[lidx],
+                  lvp->screentexpos_shadow_flag[lidx]);
+    }
 
     // gps->screen at the screen-tile that sits at the cell's top-left.
     // map_tile_pixels comes from Gui::getMousePos (viewport_zoom_factor / 4),
@@ -1104,6 +1156,7 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("       cavern-colors strength <0..1>    (tint saturation, default 0.8)\n");
                 out.print("       cavern-colors enable|disable\n");
                 out.print("       cavern-colors rough-edges on|off (rough-edge bleed tinting; default on)\n");
+                out.print("       cavern-colors z-fog on|off       (tint sprites showing through from below; default on)\n");
                 out.print("       cavern-colors sample-cell [<wx> <wy> [<wz>]]   (default: mouse pos)\n");
                 out.print("       cavern-colors dump-texture <texpos>\n");
                 out.print("Current mode:     {}\n", mode_name(color_mode));
@@ -1132,6 +1185,8 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                           dir_label(overlay_by_dir[5]),
                           dir_label(overlay_by_dir[6]),
                           dir_label(overlay_by_dir[7]));
+                out.print("Z-fog tinting:    {}\n",
+                          z_fog_enabled ? "on" : "off");
                 return CR_OK;
             }
 
@@ -1177,6 +1232,20 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 }
                 clear_tinted_cache();
                 clear_composite_cache();
+                return CR_OK;
+            }
+
+            if (params[0] == "z-fog" && params.size() >= 2) {
+                if (params[1] == "on") {
+                    z_fog_enabled = true;
+                    out.print("z-fog tinting: on\n");
+                } else if (params[1] == "off") {
+                    z_fog_enabled = false;
+                    out.print("z-fog tinting: off\n");
+                } else {
+                    out.printerr("Expected 'on' or 'off'\n");
+                    return CR_WRONG_USAGE;
+                }
                 return CR_OK;
             }
 

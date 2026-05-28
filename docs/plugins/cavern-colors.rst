@@ -25,6 +25,7 @@ Usage
     cavern-colors boost <float>
     cavern-colors strength <0..1>
     cavern-colors rough-edges on|off
+    cavern-colors z-fog on|off
     cavern-colors sample-cell [<wx> <wy> [<wz>]]
     cavern-colors dump-texture <texpos>
     cavern-colors
@@ -72,6 +73,18 @@ fringes with the rough neighbour's color and composites them under any
 corner fringes (which appear automatically where two cardinals both have
 rough neighbours). Toggle with ``cavern-colors rough-edges on|off``;
 default is on.
+
+Z-fog tinting
+-------------
+
+When the tile at the current view z-level is open/empty, DF renders
+depth-fogged sprites from floors on lower z-levels into the same screen
+cells. ``cavern-colors`` tints those fogged sprites with the material of
+the floor each one depicts, using the same per-material tint (and
+rough-edge bleed, where applicable) as cells at the current z. DF's
+depth-fog dimming is applied by DF's renderer after the tint, so the fog
+effect is preserved. Toggle with ``cavern-colors z-fog on|off``; default
+is on.
 
 Debug commands
 --------------
