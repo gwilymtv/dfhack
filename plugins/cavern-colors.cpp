@@ -16,6 +16,7 @@
 #include "modules/Gui.h"
 #include "modules/Maps.h"
 #include "modules/Screen.h"
+#include "modules/Filesystem.h"
 #include "modules/Textures.h"
 
 #include "modules/DFSDL.h"
@@ -284,62 +285,54 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 // Rough-edge bleed ("leaks")
 //
 // DF composites a per-side overlay onto cells adjacent to rough cavern
-// tiles. The overlay sprite is read from
-// world->raws.descriptors.wall_graphics_info — despite the name, this
-// table holds both full rough-cavern wall sprites *and* the rough-edge
-// fragments used to draw leaks onto adjacent floor cells. Every entry's
-// texpos points at a 32×32 RGBA sprite already baked with the embark's
-// primary cavern material palette (in practice shale), regardless of who
-// the actual rough source is on the map. Result: every leak renders in
-// that one baked palette.
+// tiles. The fringe sprites come from vanilla floors.png, which packs a
+// 9-slice for rough cavern floors at (1-based) rows 4-6 × cols 1-3:
 //
-// The neighbour (leak-receiver) cell selects which overlay to composite
-// via screentexpos_floor_flag[idx], a uint64 packed as one byte per
-// cardinal:
+//   (c1,r4) NW | (c2,r4) N  | (c3,r4) NE
+//   (c1,r5) W  | (c2,r5) C  | (c3,r5) E
+//   (c1,r6) SW | (c2,r6) S  | (c3,r6) SE
 //
+// Centre (c2,r5) is the rough tile itself — DF draws it on the rough
+// cell and our base-sprite tint path already colors it. The 8 surrounding
+// cells are the fringes that bleed onto adjacent floors.
+//
+// Spatial inversion: the sprite at compass direction X in the source
+// arrangement depicts how the rough extends INTO its neighbour at
+// direction X. From the receiver's frame the rough is on the OPPOSITE
+// side. So receiver "rough-to-S" → draw the PNG-N sprite (c2,r4): its
+// content sits along its own bottom edge, which lands at receiver's
+// south edge once composited.
+//
+// floor_flag[idx] on the receiver tells us which sides have rough. Byte
+// layout (confirmed by sample-cell):
 //   byte 0 (bits  0-7):  S
 //   byte 1 (bits  8-15): W
 //   byte 2 (bits 16-23): E
 //   byte 3 (bits 24-31): N
+// Within each byte: bits 0-2 = texture_index variant (unused for our
+// purposes — we use only the single per-direction sprite from the PNG),
+// bit 3 = enable. Bytes 4-7 hold diagonals; not yet decoded.
 //
-// Within each byte: bits 0-2 = texture_index, bit 3 = enable. Bytes 4-7
-// unobserved (likely diagonals).
-//
-// To find which wall_graphics_info entry DF uses for a given (side, byte)
-// pair we exploit the observed layout of the table's own 64-bit flags:
-//
-//   bits 0-7:   matches the floor_flag byte value (texture_index | enable)
-//   bits 20-23: 0..3, hypothesised to encode side (0=S, 1=W, 2=E, 3=N to
-//               start; permute if shapes render mis-rotated)
-//
-// DF's renderer uploads each overlay sprite to GPU at world-load and
-// ignores subsequent SDL_Surface edits (verified with paint-overlay), so
-// we can't tint in place. Fix: bake a composite per cell — base sprite
-// tinted by base mat plus alpha-blended (overlay re-tinted by rough
-// neighbour mat), register via Textures::createTile, replace
+// DF's renderer uploads each fringe sprite to GPU at world-load and
+// ignores subsequent SDL_Surface edits (verified with paint-overlay).
+// So we can't tint in place. Fix: bake a composite per cell — base
+// sprite tinted by base mat plus alpha-blended (PNG fringe re-tinted by
+// rough neighbour mat), register via Textures::createTile, replace
 // screentexpos_background[idx], zero floor_flag[idx] to suppress DF's
-// untinted overlay redraw.
+// own untinted overlay redraw.
 
 static bool leaks_enabled = true;
 
-// One canonical overlay sprite per cardinal direction (RGBA32). We
-// classify wall_graphics_info entries by alpha-weighted pixel centroid
-// rather than by flag bits: the flag-bits hypothesis turned out wrong
-// (different "side" bit values pointed at identical sprites, and at
-// L-shaped combined sprites that don't match a single edge). Centroid
-// classification works on observed pixel positions directly.
+// One fringe sprite per cardinal direction, loaded once from
+// floors.png at world-load. Indexed by ROUGH_SIDES position:
+// 0=S, 1=W, 2=E, 3=N.
 struct directional_overlay {
     bool valid = false;
     int w = 0, h = 0;
     std::vector<uint32_t> pixels;
-    int32_t source_texpos = 0; // for diagnostics
+    int32_t source_texpos = 0; // synthetic id: col*100+row (1-based)
 };
-// Indexed by ROUGH_SIDES position: 0=S, 1=W, 2=E, 3=N.
 static std::array<directional_overlay, 4> overlay_by_dir;
-// Last observed size of wall_graphics_info. DF populates the table at
-// world-load but we re-check each frame in case it grows.
-static size_t overlay_snapshot_table_size = 0;
-
 struct rough_side_info {
     int dx, dy;
     int byte_offset; // floor_flag byte index
@@ -383,160 +376,83 @@ struct composite_key_hash {
 static std::unordered_map<composite_key, TexposHandle, composite_key_hash>
     composite_cache;
 
-// Classify a 32×32 RGBA sprite as a cardinal-direction edge fringe.
-// Returns -1 unless the sprite is genuinely tiny and narrow on one axis
-// — the leak fringe DF draws is only ~3-5 pixels deep into the receiver
-// cell, with most of the sprite fully transparent. Full walls and
-// L-shapes get rejected here (they span too much of the 32×32).
-static int classify_overlay_direction(const std::vector<uint32_t> &pixels,
-                                      int w, int h) {
-    if (w != 32 || h != 32) return -1;
-    int n_transp = 0, n_opaque = 0;
-    int min_x = w, min_y = h, max_x = -1, max_y = -1;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            uint32_t px = pixels[(size_t)y * w + x];
-            uint8_t a = (px >> 24) & 0xff;
-            if (a == 0) { n_transp++; continue; }
-            if (a == 255) n_opaque++;
-            if (x < min_x) min_x = x;
-            if (y < min_y) min_y = y;
-            if (x > max_x) max_x = x;
-            if (y > max_y) max_y = y;
-        }
-    }
-    if (max_x < 0) return -1; // empty sprite
-    // Edge fringes are sparse: ≥75% fully transparent, few opaque pixels.
-    if (n_transp < (w * h * 75) / 100) return -1;
-    if (n_opaque > 120) return -1;
-    int bbox_w = max_x - min_x + 1;
-    int bbox_h = max_y - min_y + 1;
-    // A fringe is narrow on its short axis (along the edge it hugs) —
-    // ~3-5 pixels deep — and runs along the long axis. Anything thicker
-    // than 6 on the short axis is a wall body, not a fringe.
-    int smaller = std::min(bbox_w, bbox_h);
-    int larger = std::max(bbox_w, bbox_h);
-    if (smaller > 6) return -1;
-    if (larger < 8) return -1;
-    // The fringe's narrow axis tells us its orientation. The position
-    // of the bbox on that axis tells us which side it hugs.
-    if (bbox_w <= bbox_h) {
-        // Narrow horizontally → vertical fringe along W or E edge
-        int mid_x = (min_x + max_x) / 2;
-        return mid_x < 16 ? 1 /* W */ : 2 /* E */;
-    } else {
-        // Narrow vertically → horizontal fringe along N or S edge
-        int mid_y = (min_y + max_y) / 2;
-        return mid_y < 16 ? 3 /* N */ : 0 /* S */;
-    }
-}
+static void clear_composite_cache();
 
-// Mirror a 32×32 RGBA sprite horizontally (left/right) and vertically.
-static std::vector<uint32_t>
-mirror_h(const std::vector<uint32_t> &src, int w, int h) {
-    std::vector<uint32_t> dst(src.size());
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            dst[(size_t)y * w + x] = src[(size_t)y * w + (w - 1 - x)];
-    return dst;
-}
-static std::vector<uint32_t>
-mirror_v(const std::vector<uint32_t> &src, int w, int h) {
-    std::vector<uint32_t> dst(src.size());
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            dst[(size_t)y * w + x] = src[(size_t)(h - 1 - y) * w + x];
-    return dst;
-}
-
+// Load the rough-floor fringe sprites from vanilla floors.png.
+//
+// floors.png ships a 9-slice for cavern floors at (1-based) rows 4..6
+// × cols 1..3. The centre (row 5, col 2) is the rough stone tile itself
+// — DF draws that directly on rough cavern cells, our plugin already
+// tints it via the base-sprite path. The 8 surrounding cells are the
+// fringe sprites that bleed into adjacent floors.
+//
+// Spatial inversion: the sprite at compass-direction X in the source
+// arrangement depicts how the rough tile extends INTO its neighbour at
+// direction X. From the receiver's frame the rough is at the OPPOSITE
+// side. So if our floor_flag says "rough is to the south" we draw the
+// PNG-N sprite (row 4 col 2) — its fringe sits along its own bottom
+// edge, which is exactly the south edge of the receiver where it ends
+// up rendered.
+//
+// Mapping (ROUGH_SIDES index → floors.png cell, 1-based):
+//   0 S  → (col 2, row 4)  PNG-N
+//   1 W  → (col 3, row 5)  PNG-E
+//   2 E  → (col 1, row 5)  PNG-W
+//   3 N  → (col 2, row 6)  PNG-S
+//
+// Diagonals are present in the same cluster but unused for now (floor_flag
+// diagonal bytes aren't decoded yet).
 static void snapshot_overlays() {
     for (auto &o : overlay_by_dir) o = {};
-    overlay_snapshot_table_size = 0;
-    if (!world || !enabler) return;
-    auto &table = world->raws.descriptors.wall_graphics_info;
-    overlay_snapshot_table_size = table.size();
-    int n_examined = 0, n_classified = 0;
-    int per_dir[4] = {0, 0, 0, 0};
-    for (auto *info : table) {
-        if (!info) continue;
-        if (info->texpos <= 0 ||
-            (size_t)info->texpos >= enabler->textures.raws.size()) continue;
-        SDL_Surface *src =
-            (SDL_Surface *)enabler->textures.raws[info->texpos];
-        if (!src) continue;
-        SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
-        if (!fmt) continue;
-        SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
-        if (!conv) continue;
-        int w = conv->w, h = conv->h;
-        std::vector<uint32_t> pixels((size_t)w * h);
-        for (int y = 0; y < h; y++) {
-            uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
-            memcpy(&pixels[(size_t)y * w], row, (size_t)w * 4);
-        }
-        DFSDL_FreeSurface(conv);
-        n_examined++;
-        int dir = classify_overlay_direction(pixels, w, h);
-        if (dir < 0) continue;
-        per_dir[dir]++;
-        // First good fragment per direction wins. Could refine later by
-        // ranking on opacity profile, but in practice the first-seen
-        // edge fragment is usually a clean variant.
-        if (!overlay_by_dir[dir].valid) {
-            overlay_by_dir[dir].valid = true;
-            overlay_by_dir[dir].w = w;
-            overlay_by_dir[dir].h = h;
-            overlay_by_dir[dir].pixels = std::move(pixels);
-            overlay_by_dir[dir].source_texpos = info->texpos;
-            n_classified++;
-        }
+    auto path = Filesystem::getcwd() /
+        "data" / "vanilla" / "vanilla_environment" /
+        "graphics" / "images" / "floors.png";
+    SDL_Surface *src = DFIMG_Load(path.string().c_str());
+    if (!src) {
+        color_ostream_proxy c(Core::getInstance().getConsole());
+        c.printerr("[cavern-colors] could not load floors.png at '{}'\n",
+                   path.string());
+        return;
     }
-    // Backfill missing directions by mirroring from the populated ones:
-    //   W ↔ E (horizontal mirror)
-    //   N ↔ S (vertical mirror)
-    auto backfill = [](int dst, int src, bool horizontal) {
-        if (overlay_by_dir[dst].valid) return;
-        if (!overlay_by_dir[src].valid) return;
-        overlay_by_dir[dst] = overlay_by_dir[src];
-        if (horizontal)
-            overlay_by_dir[dst].pixels =
-                mirror_h(overlay_by_dir[src].pixels,
-                         overlay_by_dir[src].w, overlay_by_dir[src].h);
-        else
-            overlay_by_dir[dst].pixels =
-                mirror_v(overlay_by_dir[src].pixels,
-                         overlay_by_dir[src].w, overlay_by_dir[src].h);
+    SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
+    if (!fmt) { DFSDL_FreeSurface(src); return; }
+    SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
+    DFSDL_FreeSurface(src);
+    if (!conv) return;
+
+    auto extract = [&](int dir, int col_1based, int row_1based) {
+        int sx = (col_1based - 1) * 32;
+        int sy = (row_1based - 1) * 32;
+        if (sx + 32 > conv->w || sy + 32 > conv->h) return;
+        auto &snap = overlay_by_dir[dir];
+        snap.valid = true;
+        snap.w = 32;
+        snap.h = 32;
+        snap.pixels.assign(32 * 32, 0);
+        // Track the source coords so the status block can show what
+        // got loaded (use a synthetic identifier in source_texpos:
+        // col*100+row, easy to read).
+        snap.source_texpos = col_1based * 100 + row_1based;
+        for (int dy = 0; dy < 32; dy++) {
+            uint8_t *row = (uint8_t *)conv->pixels +
+                           (sy + dy) * conv->pitch + sx * 4;
+            memcpy(&snap.pixels[(size_t)dy * 32], row, 32 * 4);
+        }
     };
-    backfill(2, 1, true);  // E ← mirror W
-    backfill(1, 2, true);  // W ← mirror E
-    backfill(3, 0, false); // N ← mirror S
-    backfill(0, 3, false); // S ← mirror N
+    extract(0, 2, 4); // S receiver → PNG N (above centre)
+    extract(1, 3, 5); // W receiver → PNG E (right of centre)
+    extract(2, 1, 5); // E receiver → PNG W (left of centre)
+    extract(3, 2, 6); // N receiver → PNG S (below centre)
+
+    DFSDL_FreeSurface(conv);
 
     color_ostream_proxy c(Core::getInstance().getConsole());
-    c.print("[cavern-colors] snapshotted overlays from wall_graphics_info "
-            "({} entries examined, {} classified; per-dir S:{} W:{} E:{} "
-            "N:{}); after mirror-backfill: S:{} W:{} E:{} N:{}\n",
-            n_examined, n_classified,
-            per_dir[0], per_dir[1], per_dir[2], per_dir[3],
+    c.print("[cavern-colors] loaded leak fringes from floors.png "
+            "(S:{} W:{} E:{} N:{})\n",
             overlay_by_dir[0].valid ? "ok" : "-",
             overlay_by_dir[1].valid ? "ok" : "-",
             overlay_by_dir[2].valid ? "ok" : "-",
             overlay_by_dir[3].valid ? "ok" : "-");
-}
-
-static void clear_composite_cache();
-
-// Re-snapshot if the table has grown since the last snapshot. Called from
-// the render hook so we pick up overlays DF populates lazily.
-static void maybe_resnapshot_overlays() {
-    if (!world) return;
-    size_t sz = world->raws.descriptors.wall_graphics_info.size();
-    if (sz != overlay_snapshot_table_size) {
-        snapshot_overlays();
-        // Any composites built while the snapshot was empty produced
-        // un-leaked sprites; drop them so we re-bake with proper overlays.
-        clear_composite_cache();
-    }
 }
 
 static void clear_composite_cache() {
@@ -1265,7 +1181,6 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
         if (!gps || !gps->main_viewport) return;
         if (material_tints.empty()) return;
 
-        if (leaks_enabled) maybe_resnapshot_overlays();
 
         auto *vp = gps->main_viewport;
         auto dims = Gui::getDwarfmodeViewDims().map();
@@ -1862,71 +1777,6 @@ static command_result mask_texture(color_ostream &out,
 }
 
 // ---------------------------------------------------------------------------
-// Debug: iterate every wall_graphics_info entry and print the per-sprite
-// stats we use to classify fringes — transparent/translucent/opaque pixel
-// counts, opaque bounding box, and whether it currently passes the
-// classifier. Helps locate the real fringe sprites in the table and tune
-// the classifier thresholds. Output is filtered to entries that have at
-// least *some* opacity (skips entries that are entirely transparent or
-// out-of-range).
-static command_result classify_overlays(color_ostream &out) {
-    if (!world || !enabler) {
-        out.printerr("world/enabler not available\n");
-        return CR_FAILURE;
-    }
-    auto &table = world->raws.descriptors.wall_graphics_info;
-    out.print("{:>4}  {:>7}  {:>5}  {:>5}  {:>5}  {:>3}x{:<3}  cls\n",
-              "idx", "texpos", "trans", "tlucnt", "opaque", "bw", "bh");
-    int n_classified = 0;
-    int per_dir[4] = {0, 0, 0, 0};
-    for (size_t i = 0; i < table.size(); i++) {
-        auto *info = table[i];
-        if (!info) continue;
-        if (info->texpos <= 0 ||
-            (size_t)info->texpos >= enabler->textures.raws.size()) continue;
-        SDL_Surface *src =
-            (SDL_Surface *)enabler->textures.raws[info->texpos];
-        if (!src) continue;
-        SDL_PixelFormat *fmt = DFSDL_AllocFormat(SDL_PIXELFORMAT_RGBA32);
-        if (!fmt) continue;
-        SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
-        if (!conv) continue;
-        int w = conv->w, h = conv->h;
-        int n_transp = 0, n_translucent = 0, n_opaque = 0;
-        int min_x = w, min_y = h, max_x = -1, max_y = -1;
-        std::vector<uint32_t> pixels((size_t)w * h);
-        for (int y = 0; y < h; y++) {
-            uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
-            memcpy(&pixels[(size_t)y * w], row, (size_t)w * 4);
-            for (int x = 0; x < w; x++) {
-                uint8_t a = row[x * 4 + 3];
-                if (a == 0) { n_transp++; continue; }
-                if (a == 255) n_opaque++; else n_translucent++;
-                if (x < min_x) min_x = x;
-                if (y < min_y) min_y = y;
-                if (x > max_x) max_x = x;
-                if (y > max_y) max_y = y;
-            }
-        }
-        DFSDL_FreeSurface(conv);
-        if (max_x < 0) continue;
-        int bbox_w = max_x - min_x + 1;
-        int bbox_h = max_y - min_y + 1;
-        int dir = classify_overlay_direction(pixels, w, h);
-        const char *cls = "-";
-        if (dir == 0) { cls = "S"; per_dir[0]++; n_classified++; }
-        else if (dir == 1) { cls = "W"; per_dir[1]++; n_classified++; }
-        else if (dir == 2) { cls = "E"; per_dir[2]++; n_classified++; }
-        else if (dir == 3) { cls = "N"; per_dir[3]++; n_classified++; }
-        out.print("{:>4}  {:>7}  {:>5}  {:>5}  {:>5}  {:>3}x{:<3}  {}\n",
-                  i, info->texpos, n_transp, n_translucent, n_opaque,
-                  bbox_w, bbox_h, cls);
-    }
-    out.print("\n{} classified  (S:{} W:{} E:{} N:{})\n",
-              n_classified, per_dir[0], per_dir[1], per_dir[2], per_dir[3]);
-    return CR_OK;
-}
-
 // Debug: rewrite every opaque pixel of the SDL_Surface backing the given
 // texpos to solid red, in place. Used to test whether DF's renderer actually
 // re-reads pixel data from enabler->textures.raws on each frame (so an
@@ -2190,7 +2040,6 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("       cavern-colors dump-texture <texpos>\n");
                 out.print("       cavern-colors mask-texture <texpos>\n");
                 out.print("       cavern-colors paint-overlay <texpos>\n");
-                out.print("       cavern-colors classify-overlays\n");
                 out.print("       cavern-colors extract-palette\n");
                 out.print("       cavern-colors dump-wall-graphics\n");
                 out.print("       cavern-colors dump-baked\n");
@@ -2200,18 +2049,21 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
                 auto dir_label = [](const directional_overlay &o) {
                     if (!o.valid) return std::string("-");
-                    return std::to_string(o.source_texpos);
+                    // source_texpos here holds the floors.png cell id
+                    // we stamped at load: col*100 + row (1-based).
+                    int col = o.source_texpos / 100;
+                    int row = o.source_texpos % 100;
+                    return fmt::format("c{}r{}", col, row);
                 };
                 out.print("Leak tinting:     {} "
-                          "({} composite(s) cached, dir overlays "
-                          "S:{} W:{} E:{} N:{}, last table size {})\n",
+                          "({} composite(s) cached, fringes "
+                          "S:{} W:{} E:{} N:{})\n",
                           leaks_enabled ? "on" : "off",
                           composite_cache.size(),
                           dir_label(overlay_by_dir[0]),
                           dir_label(overlay_by_dir[1]),
                           dir_label(overlay_by_dir[2]),
-                          dir_label(overlay_by_dir[3]),
-                          overlay_snapshot_table_size);
+                          dir_label(overlay_by_dir[3]));
                 out.print("Collecting walls: {} ({} mat(s) base / "
                          "{} mat(s) overlay)\n",
                          collect_walls ? "yes" : "no",
@@ -2337,10 +2189,6 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 return paint_overlay(out, params);
             }
 
-            if (params[0] == "classify-overlays") {
-                return classify_overlays(out);
-            }
-
             if (params[0] == "extract-palette") {
                 return extract_palette(out);
             }
@@ -2391,7 +2239,6 @@ DFhackCExport void plugin_onstatechange(color_ostream &out, state_change_event e
         palette_by_mat.clear();
         observed_overlays.clear();
         for (auto &o : overlay_by_dir) o = {};
-        overlay_snapshot_table_size = 0;
         break;
     default:
         break;
