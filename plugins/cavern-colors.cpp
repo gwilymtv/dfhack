@@ -285,54 +285,73 @@ static TexposHandle get_tinted(int32_t src_texpos, int mat) {
 //
 // DF composites a per-side overlay onto cells adjacent to rough cavern
 // tiles. The overlay sprite is read from
-// world->raws.descriptors.boulder_floor_graphics_info, keyed by
-// (color_index, texture_index). Although the table is keyed by color_index,
-// the 8 entries DF actually generates carry a single material's palette
-// baked in (whichever material seeded the table at world-load) and DF
-// reuses them for *all* rough cavern materials. Result: every leak is drawn
-// in that one baked palette regardless of the rough source's material.
+// world->raws.descriptors.wall_graphics_info — despite the name, this
+// table holds both full rough-cavern wall sprites *and* the rough-edge
+// fragments used to draw leaks onto adjacent floor cells. Every entry's
+// texpos points at a 32×32 RGBA sprite already baked with the embark's
+// primary cavern material palette (in practice shale), regardless of who
+// the actual rough source is on the map. Result: every leak renders in
+// that one baked palette.
 //
-// The neighbour cell selects which overlays to composite via
-// screentexpos_floor_flag[idx], a uint64 packed as one byte per cardinal:
+// The neighbour (leak-receiver) cell selects which overlay to composite
+// via screentexpos_floor_flag[idx], a uint64 packed as one byte per
+// cardinal:
 //
 //   byte 0 (bits  0-7):  S
 //   byte 1 (bits  8-15): W
 //   byte 2 (bits 16-23): E
 //   byte 3 (bits 24-31): N
 //
-// Within each byte: bits 0-2 = texture_index (matches boulder_floor_graphics
-// entries 0..7), bit 3 = enable. Bytes 4-7 unobserved so far (likely
-// diagonals); cardinal coverage is the first cut. DF's renderer uploads the
-// overlay sprite to GPU at world-load and ignores later edits to the
-// SDL_Surface buffer (verified with paint-overlay), so we can't tint the
-// overlay in place. The fix is to bake a composite sprite per cell:
-// (base sprite tinted by base mat) + alpha-blended (overlay re-tinted by
-// the rough neighbour's mat), register it via Textures::createTile, point
-// screentexpos_background at the new texpos, and zero floor_flag[idx] so
-// DF doesn't redraw the original untinted overlay on top.
+// Within each byte: bits 0-2 = texture_index, bit 3 = enable. Bytes 4-7
+// unobserved (likely diagonals).
+//
+// To find which wall_graphics_info entry DF uses for a given (side, byte)
+// pair we exploit the observed layout of the table's own 64-bit flags:
+//
+//   bits 0-7:   matches the floor_flag byte value (texture_index | enable)
+//   bits 20-23: 0..3, hypothesised to encode side (0=S, 1=W, 2=E, 3=N to
+//               start; permute if shapes render mis-rotated)
+//
+// DF's renderer uploads each overlay sprite to GPU at world-load and
+// ignores subsequent SDL_Surface edits (verified with paint-overlay), so
+// we can't tint in place. Fix: bake a composite per cell — base sprite
+// tinted by base mat plus alpha-blended (overlay re-tinted by rough
+// neighbour mat), register via Textures::createTile, replace
+// screentexpos_background[idx], zero floor_flag[idx] to suppress DF's
+// untinted overlay redraw.
 
 static bool leaks_enabled = true;
 
-// Snapshot of each overlay sprite's pixels, RGBA32, keyed by texture_index.
+// Snapshot of one wall_graphics_info entry: pixels (RGBA32), original
+// flag and texpos preserved for lookup and debugging.
 struct overlay_snapshot {
     int w = 0, h = 0;
     std::vector<uint32_t> pixels;
+    uint64_t flag = 0;
+    int32_t texpos = 0;
 };
-static std::array<overlay_snapshot, 8> overlay_snapshots;
-// Last observed size of world->raws.descriptors.boulder_floor_graphics_info.
-// DF appears to populate this table lazily, so we re-snapshot whenever the
-// vector grows past what we last saw.
+static std::vector<overlay_snapshot> overlay_snapshots;
+// (side << 8) | byte_value → first matching snapshot index. Same key
+// shape DF uses to look up an entry from the cell's floor_flag.
+static std::unordered_map<int, int> overlay_lookup;
+// Last observed size of wall_graphics_info. DF populates the table at
+// world-load but we re-check each frame in case it grows.
 static size_t overlay_snapshot_table_size = 0;
 
 struct rough_side_info {
     int dx, dy;
-    int byte_offset; // floor_flag byte index
+    int byte_offset;       // floor_flag byte index
+    int wall_graphics_side; // wall_graphics_info flag bits 20-23 value
 };
+// Mapping hypothesis: wall_graphics_info side bits 20-23 use same order
+// as our floor_flag bytes (0=S, 1=W, 2=E, 3=N). If leak shapes appear
+// mirrored or rotated when this lands, permute the wall_graphics_side
+// field below.
 static const std::array<rough_side_info, 4> ROUGH_SIDES = {{
-    { 0, +1, 0}, // S (byte 0)
-    {-1,  0, 1}, // W (byte 1)
-    {+1,  0, 2}, // E (byte 2)
-    { 0, -1, 3}, // N (byte 3)
+    { 0, +1, 0, 0}, // S
+    {-1,  0, 1, 1}, // W
+    {+1,  0, 2, 2}, // E
+    { 0, -1, 3, 3}, // N
 }};
 
 // Composite cache key. (base_texpos, floor_flag, per-side rough neighbour
@@ -368,16 +387,16 @@ static std::unordered_map<composite_key, TexposHandle, composite_key_hash>
     composite_cache;
 
 static void snapshot_overlays() {
-    for (auto &s : overlay_snapshots) s = {};
+    overlay_snapshots.clear();
+    overlay_lookup.clear();
     overlay_snapshot_table_size = 0;
     if (!world || !enabler) return;
-    auto &table = world->raws.descriptors.boulder_floor_graphics_info;
+    auto &table = world->raws.descriptors.wall_graphics_info;
     overlay_snapshot_table_size = table.size();
+    overlay_snapshots.reserve(table.size());
     int n = 0;
     for (auto *info : table) {
         if (!info) continue;
-        int ti = info->flags.bits.texture_index;
-        if (ti < 0 || ti >= (int)overlay_snapshots.size()) continue;
         if (info->texpos <= 0 ||
             (size_t)info->texpos >= enabler->textures.raws.size()) continue;
         SDL_Surface *src =
@@ -387,21 +406,33 @@ static void snapshot_overlays() {
         if (!fmt) continue;
         SDL_Surface *conv = DFSDL_ConvertSurface(src, fmt, 0);
         if (!conv) continue;
-        auto &snap = overlay_snapshots[ti];
+        overlay_snapshot snap;
         snap.w = conv->w;
         snap.h = conv->h;
+        snap.flag = info->flags.whole;
+        snap.texpos = info->texpos;
         snap.pixels.assign((size_t)snap.w * snap.h, 0);
         for (int y = 0; y < snap.h; y++) {
             uint8_t *row = (uint8_t *)conv->pixels + y * conv->pitch;
             memcpy(&snap.pixels[(size_t)y * snap.w], row, (size_t)snap.w * 4);
         }
         DFSDL_FreeSurface(conv);
+        // Index by (side bits 20-23, low byte). First match wins; the
+        // table commonly has multiple variants per key, and we have no
+        // signal for picking among them, so deterministically pick the
+        // first encountered.
+        int side = (int)((snap.flag >> 20) & 0xf);
+        int byte_value = (int)(snap.flag & 0xff);
+        int key = (side << 8) | byte_value;
+        if (!overlay_lookup.count(key))
+            overlay_lookup[key] = (int)overlay_snapshots.size();
+        overlay_snapshots.push_back(std::move(snap));
         n++;
     }
     color_ostream_proxy c(Core::getInstance().getConsole());
-    c.print("[cavern-colors] snapshotted {} boulder overlay sprite(s) "
-            "from a table of {}\n",
-            n, table.size());
+    c.print("[cavern-colors] snapshotted {} wall overlay sprite(s) "
+            "from a table of {} ({} unique (side, byte) key(s))\n",
+            n, table.size(), overlay_lookup.size());
 }
 
 static void clear_composite_cache();
@@ -410,11 +441,11 @@ static void clear_composite_cache();
 // the render hook so we pick up overlays DF populates lazily.
 static void maybe_resnapshot_overlays() {
     if (!world) return;
-    size_t sz = world->raws.descriptors.boulder_floor_graphics_info.size();
+    size_t sz = world->raws.descriptors.wall_graphics_info.size();
     if (sz != overlay_snapshot_table_size) {
         snapshot_overlays();
-        // Bump composite cache: any composites built while the snapshot was
-        // empty produced un-leaked sprites; they need to be regenerated.
+        // Any composites built while the snapshot was empty produced
+        // un-leaked sprites; drop them so we re-bake with proper overlays.
         clear_composite_cache();
     }
 }
@@ -1070,12 +1101,14 @@ static TexposHandle make_composite(const composite_key &key) {
     // neighbour's mat) on top.
     int16_t side_mats[4] = { key.mat_s, key.mat_w, key.mat_e, key.mat_n };
     for (size_t i = 0; i < ROUGH_SIDES.size(); i++) {
-        int byte = (int)((key.floor_flag >>
-                          (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
-        if (!(byte & 0x08)) continue;
-        int ti = byte & 0x07;
-        if (ti < 0 || ti >= (int)overlay_snapshots.size()) continue;
-        const auto &snap = overlay_snapshots[ti];
+        int byte_value = (int)((key.floor_flag >>
+                                (ROUGH_SIDES[i].byte_offset * 8)) & 0xff);
+        if (!(byte_value & 0x08)) continue;
+        int lookup_key =
+            (ROUGH_SIDES[i].wall_graphics_side << 8) | byte_value;
+        auto it = overlay_lookup.find(lookup_key);
+        if (it == overlay_lookup.end()) continue;
+        const auto &snap = overlay_snapshots[it->second];
         if (snap.pixels.empty()) continue;
         if (snap.w != w || snap.h != h) continue;
         int16_t mat = side_mats[i];
@@ -1955,18 +1988,16 @@ DFhackCExport command_result plugin_init(color_ostream &out,
                 out.print("Brightness boost: {}\n", brightness_boost);
                 out.print("Tint strength:    {}\n", tint_strength);
                 out.print("Enabled:          {}\n", is_enabled ? "yes" : "no");
-                {
-                    int populated = 0;
-                    for (auto &s : overlay_snapshots)
-                        if (!s.pixels.empty()) populated++;
-                    out.print("Leak tinting:     {} ({} composite(s) cached, "
-                              "{}/{} overlay snapshot(s) populated, "
-                              "last table size {})\n",
-                              leaks_enabled ? "on" : "off",
-                              composite_cache.size(),
-                              populated, (int)overlay_snapshots.size(),
-                              overlay_snapshot_table_size);
-                }
+                out.print("Leak tinting:     {} "
+                          "({} composite(s) cached, "
+                          "{} overlay snapshot(s), "
+                          "{} (side, byte) lookup key(s), "
+                          "last table size {})\n",
+                          leaks_enabled ? "on" : "off",
+                          composite_cache.size(),
+                          overlay_snapshots.size(),
+                          overlay_lookup.size(),
+                          overlay_snapshot_table_size);
                 out.print("Collecting walls: {} ({} mat(s) base / "
                          "{} mat(s) overlay)\n",
                          collect_walls ? "yes" : "no",
@@ -2137,7 +2168,9 @@ DFhackCExport void plugin_onstatechange(color_ostream &out, state_change_event e
         wall_overlay_texposes_by_mat.clear();
         palette_by_mat.clear();
         observed_overlays.clear();
-        for (auto &s : overlay_snapshots) s = {};
+        overlay_snapshots.clear();
+        overlay_lookup.clear();
+        overlay_snapshot_table_size = 0;
         break;
     default:
         break;
