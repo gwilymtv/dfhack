@@ -539,15 +539,17 @@ static int get_vein_mat(df::map_block *block, int tx, int ty) {
 
 static int get_layer_mat(df::map_block *block, int tx, int ty) {
     auto &des = block->designation[tx][ty];
-    // For subterranean tiles, override the per-tile biome bits with eHere
-    // (=4, the embark's home region). DF's display uses the home-region
-    // geology for cavern/cave stone regardless of per-tile biome attribution,
-    // so per-tile bits at biome boundaries can mis-assign cavern floors to a
-    // neighbouring region's layer material (e.g. LIMESTONE in the south
-    // neighbour where the home region is SHALE). The per-tile bits remain
-    // authoritative for above-ground tiles where surface biome actually
-    // varies meaningfully.
-    int biome = des.bits.subterranean ? 4 /* eHere */ : des.bits.biome;
+    // Always override the per-tile biome bits with eHere (=4, the embark's
+    // home region). DF's display uses the home-region geology for layer
+    // stone regardless of per-tile biome attribution, both above- and
+    // below-ground. Per-tile biome bits at boundaries get mis-attributed
+    // to neighbouring regions, which makes our material lookup return
+    // the wrong stone (e.g. LIMESTONE in the south neighbour's biome
+    // where the home region's layer at that depth is SHALE). The same
+    // mis-attribution affects above-ground tiles near surface biome
+    // boundaries — shale getting tinted as limestone, etc. — so we
+    // unconditionally use the home region.
+    int biome = 4 /* eHere */;
     int geolayer = des.bits.geolayer_index;
     if (biome < 0 || (size_t)biome >= layer_mats.size()) return -1;
     auto &row = layer_mats[biome];
