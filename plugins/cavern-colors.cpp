@@ -384,13 +384,16 @@ static std::unordered_map<composite_key, TexposHandle, composite_key_hash>
     composite_cache;
 
 // Classify a 32×32 RGBA sprite into a cardinal direction by alpha-weighted
-// centroid. Returns -1 if the sprite isn't a good directional fragment
-// (e.g., too opaque, centroid too central, or too few opaque pixels).
+// centroid + opaque-pixel bounding box. Returns -1 if it isn't a clean
+// directional edge fragment — full-wall sprites (dense, spread across the
+// whole 32×32) and L-shape combined sprites (opaque pixels clustered on
+// two perpendicular edges) get rejected here.
 static int classify_overlay_direction(const std::vector<uint32_t> &pixels,
                                       int w, int h) {
     if (w != 32 || h != 32) return -1;
     int n_transp = 0;
     double sum_x = 0, sum_y = 0, sum_w = 0;
+    int min_x = w, min_y = h, max_x = -1, max_y = -1;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             uint32_t px = pixels[(size_t)y * w + x];
@@ -399,22 +402,40 @@ static int classify_overlay_direction(const std::vector<uint32_t> &pixels,
             sum_x += x * a;
             sum_y += y * a;
             sum_w += a;
+            if (x < min_x) min_x = x;
+            if (y < min_y) min_y = y;
+            if (x > max_x) max_x = x;
+            if (y > max_y) max_y = y;
         }
     }
     if (sum_w < 200) return -1; // too few opaque pixels
-    // Skip dense sprites (full walls). Edge fragments are >=30% transparent.
-    if (n_transp < (w * h * 30) / 100) return -1;
+    // Edge fragments are sparse: at least 60% fully transparent.
+    if (n_transp < (w * h * 60) / 100) return -1;
+    // Reject sprites whose opaque pixels span almost the whole 32×32
+    // (full walls) or both axes (L-shapes / corner composites).
+    int bbox_w = max_x - min_x + 1;
+    int bbox_h = max_y - min_y + 1;
+    // A clean edge fragment is thin on one axis: smaller dim <= ~16,
+    // and the other dim is the long edge. If both dims are large, the
+    // sprite covers a corner or a full body — skip.
+    int smaller = std::min(bbox_w, bbox_h);
+    int larger = std::max(bbox_w, bbox_h);
+    if (smaller > 18) return -1;        // too 2-D, looks like a body
+    if (larger < 12) return -1;          // too tiny, probably noise
     double cx = sum_x / sum_w;
     double cy = sum_y / sum_w;
-    // Side: pick the dominant axis from the centre.
     double dx = cx - (w - 1) / 2.0;
     double dy = cy - (h - 1) / 2.0;
-    if (std::abs(dx) < 3.0 && std::abs(dy) < 3.0) return -1; // too central
-    if (std::abs(dx) > std::abs(dy)) {
+    // The "direction" the fragment faces is determined by which side it
+    // hugs — i.e., its dominant axis offset must be substantial AND
+    // larger than the perpendicular offset by a clear margin.
+    if (std::abs(dx) > std::abs(dy) * 1.5 && std::abs(dx) > 4.0) {
         return dx < 0 ? 1 /* W */ : 2 /* E */;
-    } else {
+    }
+    if (std::abs(dy) > std::abs(dx) * 1.5 && std::abs(dy) > 4.0) {
         return dy < 0 ? 3 /* N */ : 0 /* S */;
     }
+    return -1;
 }
 
 // Mirror a 32×32 RGBA sprite horizontally (left/right) and vertically.
