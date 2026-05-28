@@ -319,6 +319,10 @@ struct overlay_snapshot {
     std::vector<uint32_t> pixels;
 };
 static std::array<overlay_snapshot, 8> overlay_snapshots;
+// Last observed size of world->raws.descriptors.boulder_floor_graphics_info.
+// DF appears to populate this table lazily, so we re-snapshot whenever the
+// vector grows past what we last saw.
+static size_t overlay_snapshot_table_size = 0;
 
 struct rough_side_info {
     int dx, dy;
@@ -365,8 +369,11 @@ static std::unordered_map<composite_key, TexposHandle, composite_key_hash>
 
 static void snapshot_overlays() {
     for (auto &s : overlay_snapshots) s = {};
+    overlay_snapshot_table_size = 0;
     if (!world || !enabler) return;
     auto &table = world->raws.descriptors.boulder_floor_graphics_info;
+    overlay_snapshot_table_size = table.size();
+    int n = 0;
     for (auto *info : table) {
         if (!info) continue;
         int ti = info->flags.bits.texture_index;
@@ -389,9 +396,23 @@ static void snapshot_overlays() {
             memcpy(&snap.pixels[(size_t)y * snap.w], row, (size_t)snap.w * 4);
         }
         DFSDL_FreeSurface(conv);
-        DEBUG(log).print(
-            "snapshotted boulder overlay ti={} src_texpos={} {}x{}\n",
-            ti, info->texpos, snap.w, snap.h);
+        n++;
+    }
+    INFO(log).print(
+        "snapshotted {} boulder overlay sprite(s) from a table of {}\n",
+        n, table.size());
+}
+
+// Re-snapshot if the table has grown since the last snapshot. Called from
+// the render hook so we pick up overlays DF populates lazily.
+static void maybe_resnapshot_overlays() {
+    if (!world) return;
+    size_t sz = world->raws.descriptors.boulder_floor_graphics_info.size();
+    if (sz != overlay_snapshot_table_size) {
+        snapshot_overlays();
+        // Bump composite cache: any composites built while the snapshot was
+        // empty produced un-leaked sprites; they need to be regenerated.
+        clear_composite_cache();
     }
 }
 
@@ -1123,6 +1144,8 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
         if (!gps || !gps->main_viewport) return;
         if (material_tints.empty()) return;
 
+        if (leaks_enabled) maybe_resnapshot_overlays();
+
         auto *vp = gps->main_viewport;
         auto dims = Gui::getDwarfmodeViewDims().map();
 
@@ -1250,8 +1273,16 @@ struct cavern_colors_hook : df::viewscreen_dwarfmodest {
                 uint64_t flag = 0;
                 if (leaks_enabled &&
                     shape == df::tiletype_shape_basic::Floor &&
-                    vp->screentexpos_floor_flag)
-                    flag = vp->screentexpos_floor_flag[idx];
+                    vp->screentexpos_floor_flag) {
+                    // Only take the composite path if we have at least one
+                    // overlay snapshot to use; otherwise the composite would
+                    // strip DF's own leak draw and replace it with nothing.
+                    bool have_any = false;
+                    for (auto &s : overlay_snapshots)
+                        if (!s.pixels.empty()) { have_any = true; break; }
+                    if (have_any)
+                        flag = vp->screentexpos_floor_flag[idx];
+                }
 
                 if (flag != 0) {
                     TexposHandle h = get_composite(src_texpos, flag,
