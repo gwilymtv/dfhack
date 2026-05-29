@@ -291,6 +291,10 @@ MapPickScreen.ATTRS{
     -- stockpile would open its native dialog instead of toggling our link.
     -- Consume all clicks; we route them ourselves in onInput.
     pass_mouse_clicks=false,
+    -- ZScreen defaults pass_movement_keys=false, which blocks WASD / arrow
+    -- keys / edge-scroll and pins the camera.  Let them through so the
+    -- user can navigate to off-screen candidates without exiting pick mode.
+    pass_movement_keys=true,
     target_bld=DEFAULT_NIL,
     target_is_workshop=DEFAULT_NIL,
 }

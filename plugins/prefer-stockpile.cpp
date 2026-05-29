@@ -29,7 +29,10 @@
 #include "df/building_furnacest.h"
 #include "df/building_stockpilest.h"
 #include "df/building_workshopst.h"
+#include "df/general_ref.h"
+#include "df/general_ref_type.h"
 #include "df/item.h"
+#include "df/item_body_component.h"
 #include "df/item_flags.h"
 #include "df/items_other_id.h"
 #include "df/job.h"
@@ -188,19 +191,53 @@ static std::string building_label(int32_t id);
 // ---------------------------------------------------------------------------
 // Core logic
 
+// Universal item-disqualifying flags, mirroring buildingplan_cycle.cpp's
+// BadFlags.  Built lazily so it can include union-bitfield init.
+static uint32_t bad_item_flags_mask() {
+    static uint32_t mask = []{
+        df::item_flags f;
+        f.bits.dump = true;
+        f.bits.garbage_collect = true;
+        f.bits.hostile = true;
+        f.bits.on_fire = true;
+        f.bits.rotten = true;
+        f.bits.trader = true;
+        f.bits.in_building = true;
+        f.bits.construction = true;
+        f.bits.owned = true;
+        f.bits.removed = true;
+        f.bits.encased = true;
+        f.bits.spider_web = true;
+        // in_job and forbid are handled with their own counters; keep them
+        // out of the catch-all so the rejection-reason summary stays useful.
+        return f.whole;
+    }();
+    return mask;
+}
+
 // Returns true if item's resolved position falls within sp's tile extents.
 //
 // Does not use item->getStockpile() (vtable slot 23): that only covers items
 // explicitly assigned via DF's container mechanism. Free items like boulders
 // use position-based tracking and return nullptr from getStockpile().
-// Items::getPosition handles both free items and items inside containers.
+//
+// Items::getPosition handles three cases for us:
+//   - free items: returns item->pos
+//   - items inside a container (bin/bag/barrel): walks the CONTAINED_IN_ITEM
+//     chain up to the outermost container's tile (i.e. the stockpile tile,
+//     if it's stockpiled).  Items.cpp only does this when in_inventory is
+//     set on the item — so we deliberately do *not* early-return on that
+//     flag, otherwise we'd silently reject everything in bins/bags.
+//   - items held by a unit: returns the unit's tile.  We reject these up
+//     front via getHolderUnit, since a dwarf carrying leather mid-haul
+//     standing in the stockpile would otherwise look in-bounds.
 //
 // This is a simplified form of StockpileInfo::inStockpile() in uicommon.h.
 // uicommon.h couldn't be included here because it requires a specific include
 // order (full df::item definition + old World API) that conflicted with our
 // headers. Revisit if uicommon.h is ever cleaned up.
 static bool item_in_stockpile(df::item *item, df::building_stockpilest *sp) {
-    if (item->flags.bits.in_inventory) return false;
+    if (Items::getHolderUnit(item)) return false;
 
     df::coord pos = Items::getPosition(item);
     if (!pos.isValid() || pos.z != sp->z) return false;
@@ -270,11 +307,27 @@ static df::item *find_preferred_item(
     // Job::isSuitableMaterial uses the actual item's material and runs the
     // same iinfo.matches() — both type-side and material-side bit checks —
     // so it covers what isSuitableItem would have done, correctly.
-    int n_in_job = 0, n_forbid = 0, n_not_in_sp = 0;
+    int n_in_job = 0, n_forbid = 0, n_bad_flags = 0;
+    int n_in_wheelbarrow = 0, n_sp_assigned = 0, n_not_in_sp = 0;
     int n_type_mismatch = 0, n_subtype_mismatch = 0, n_not_buildmat = 0;
-    int n_not_metal_ore = 0, n_no_tool_use = 0;
+    int n_not_metal_ore = 0, n_no_tool_use = 0, n_not_empty = 0;
+    int n_wrong_body_part = 0;
     int n_job_mat_mismatch = 0, n_bad_mat = 0;
     df::item *bad_mat_sample = nullptr;
+
+    // Pre-compute which body-part flags the jitem demands (jitem.flags2 maps
+    // to item_body_component_flag bits on a corpse piece).  Job::isSuitableMaterial
+    // only checks the underlying creature material, but a skull, a horn, and
+    // a tooth from the same animal share that material — only their
+    // corpse_flags differ.  We have to match those directly or "Make horn
+    // crafts" will happily accept a skull, etc.
+    const auto &f2 = jitem->flags2;
+    const bool needs_body_part_match = f2.bits.horn || f2.bits.bone
+        || f2.bits.shell || f2.bits.pearl || f2.bits.ivory_tooth
+        || f2.bits.hair_wool || f2.bits.yarn || f2.bits.leather
+        || f2.bits.plant || f2.bits.totemable;
+
+    const uint32_t bad_mask = bad_item_flags_mask();
 
     // Work orders (and many reaction-driven jobs) leave the jitem filter
     // generic (mat_type=0 mat_index=-1 = any inorganic) and pin the specific
@@ -287,6 +340,22 @@ static df::item *find_preferred_item(
         if (!item) continue;
         if (item->flags.bits.in_job)  { n_in_job++;  continue; }
         if (item->flags.bits.forbid)  { n_forbid++;  continue; }
+        if (item->flags.whole & bad_mask) { n_bad_flags++; continue; }
+
+        // Container assigned to a stockpile we don't control: respect the
+        // user's existing assignment instead of hijacking it.
+        if (item->isAssignedToStockpile()) { n_sp_assigned++; continue; }
+
+        // Items currently being hauled inside a wheelbarrow are mid-flight;
+        // attaching one races the active haul.  Detect by walking up the
+        // container chain to a TOOL with the HEAVY_OBJECT_HAULING use.
+        {
+            auto *container = Items::getContainer(item);
+            if (container && container->getType() == df::item_type::TOOL
+                && container->hasToolUse(df::tool_uses::HEAVY_OBJECT_HAULING)) {
+                n_in_wheelbarrow++; continue;
+            }
+        }
 
         bool in_preferred = false;
         for (auto *sp : stockpiles) {
@@ -310,10 +379,51 @@ static df::item *find_preferred_item(
             && !item->hasToolUse(jitem->has_tool_use)) {
             n_no_tool_use++; continue;
         }
+        // Empty-container check (mirrors buildingplan_cycle.cpp): if the
+        // job demands an empty container (e.g. brew-drink wants an empty
+        // barrel), reject any item that has a CONTAINS_ITEM ref.  The
+        // lye_milk_free variant allows the contained item to be water.
+        if (jitem->flags1.bits.empty || jitem->flags2.bits.lye_milk_free) {
+            auto *gref = Items::getGeneralRef(item, df::general_ref_type::CONTAINS_ITEM);
+            if (gref) {
+                if (jitem->flags1.bits.empty) {
+                    n_not_empty++; continue;
+                }
+                if (auto *contained = gref->getItem()) {
+                    MaterialInfo mi;
+                    mi.decode(contained);
+                    if (mi.getToken() != "WATER") {
+                        n_not_empty++; continue;
+                    }
+                }
+            }
+        }
         if (job_has_mat
             && (item->getMaterial() != job->mat_type
                 || item->getMaterialIndex() != job->mat_index)) {
             n_job_mat_mismatch++; continue;
+        }
+        // Body-part discrimination for corpse pieces.  Only the specific
+        // corpse_flags bit (and isTotemable for totem jobs) tells skull
+        // from horn from bone.  jitem.flags2 maps 1:1 to corpse_flags bits,
+        // except ivory_tooth maps to corpse_flags.tooth and totemable goes
+        // through the item virtual.
+        if (needs_body_part_match) {
+            auto *bc = virtual_cast<df::item_body_component>(item);
+            if (!bc) { n_wrong_body_part++; continue; }
+            const auto &cf = bc->corpse_flags.bits;
+            if (f2.bits.horn        && !cf.horn)      { n_wrong_body_part++; continue; }
+            if (f2.bits.bone        && !cf.bone)      { n_wrong_body_part++; continue; }
+            if (f2.bits.shell       && !cf.shell)     { n_wrong_body_part++; continue; }
+            if (f2.bits.pearl       && !cf.pearl)     { n_wrong_body_part++; continue; }
+            if (f2.bits.ivory_tooth && !cf.tooth)     { n_wrong_body_part++; continue; }
+            if (f2.bits.hair_wool   && !cf.hair_wool) { n_wrong_body_part++; continue; }
+            if (f2.bits.yarn        && !cf.yarn)      { n_wrong_body_part++; continue; }
+            if (f2.bits.leather     && !cf.leather)   { n_wrong_body_part++; continue; }
+            if (f2.bits.plant       && !cf.plant)     { n_wrong_body_part++; continue; }
+            if (f2.bits.totemable   && !item->isTotemable()) {
+                n_wrong_body_part++; continue;
+            }
         }
 
         if (!Job::isSuitableMaterial(jitem, item->getMaterial(),
@@ -326,15 +436,17 @@ static df::item *find_preferred_item(
     }
 
     out.print("  slot {}: no preferred item"
-              " (scanned {} — in_job:{} forbid:{} not_in_sp:{}"
+              " (scanned {} — in_job:{} forbid:{} bad_flags:{}"
+              " sp_assigned:{} in_wheelbarrow:{} not_in_sp:{}"
               " type_mismatch:{} subtype_mismatch:{} not_buildmat:{}"
-              " not_metal_ore:{} no_tool_use:{}"
-              " job_mat_mismatch:{} bad_mat:{})\n",
+              " not_metal_ore:{} no_tool_use:{} not_empty:{}"
+              " wrong_body_part:{} job_mat_mismatch:{} bad_mat:{})\n",
               slot_idx, (int)world->items.other[other_id].size(),
-              n_in_job, n_forbid, n_not_in_sp,
+              n_in_job, n_forbid, n_bad_flags,
+              n_sp_assigned, n_in_wheelbarrow, n_not_in_sp,
               n_type_mismatch, n_subtype_mismatch, n_not_buildmat,
-              n_not_metal_ore, n_no_tool_use,
-              n_job_mat_mismatch, n_bad_mat);
+              n_not_metal_ore, n_no_tool_use, n_not_empty,
+              n_wrong_body_part, n_job_mat_mismatch, n_bad_mat);
     if (bad_mat_sample) {
         out.print("  slot {}: bad_mat sample — item {} type={} subtype={}"
                   " mat_type={} mat_index={}\n",
@@ -689,10 +801,12 @@ DFhackCExport command_result plugin_load_site_data(color_ostream &out) {
     is_enabled = config.get_bool(CONFIG_IS_ENABLED);
 
     int saved_version = config.get_int(CONFIG_SCHEMA_VERSION);
-    // saved_version == 0 means "pre-schema-marker" — same on-disk format as
-    // v1, just unstamped — adopt as v1 silently.  Any other mismatch we
-    // refuse to read until a migration is written.
-    if (saved_version == 0) {
+    // PersistentDataItem ints default to -1 for slots that were never set
+    // (see library/modules/Persistence.cpp). -1 / 0 therefore both mean
+    // "pre-schema-marker" — same on-disk format as v1, just unstamped —
+    // adopt as v1 silently and stamp the slot so future loads short-circuit.
+    // Any other mismatch we refuse to read until a migration is written.
+    if (saved_version <= 0) {
         config.set_int(CONFIG_SCHEMA_VERSION, SCHEMA_VERSION);
         saved_version = SCHEMA_VERSION;
     }
