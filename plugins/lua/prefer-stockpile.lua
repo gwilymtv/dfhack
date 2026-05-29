@@ -187,6 +187,12 @@ function EditDialog:init()
                 },
                 widgets.HotkeyLabel{
                     frame={l=14, b=0},
+                    key='CUSTOM_M',
+                    label='Pick from map',
+                    on_activate=self:callback('enter_map_pick'),
+                },
+                widgets.HotkeyLabel{
+                    frame={l=34, b=0},
                     key='LEAVESCREEN',
                     label='Close',
                     on_activate=self:callback('dismiss'),
@@ -241,6 +247,13 @@ function EditDialog:refresh()
     if prev_filter and #prev_filter > 0 then list:setFilter(prev_filter) end
 end
 
+function EditDialog:enter_map_pick()
+    -- Hand off to MapPickScreen; it will re-open this dialog on dismiss.
+    local target, is_ws = self.target_bld, self.target_is_workshop
+    self:dismiss()
+    MapPickScreen{target_bld=target, target_is_workshop=is_ws}:show()
+end
+
 function EditDialog:toggle_selected()
     local _, choice = self.subviews.list:getSelected()
     if not choice then return end
@@ -259,7 +272,136 @@ function EditDialog:toggle_selected()
     self:refresh()
 end
 
-local function open_edit_dialog(target_bld, is_workshop)
+local open_edit_dialog -- forward; defined below MapPickScreen
+
+-- ---------------------------------------------------------------------------
+-- Map-pick mode: dismiss the dialog and let the user click a candidate on
+-- the map.  Multi-toggle (stays active until dismissed); Esc / right-click
+-- exits and reopens the dialog.
+
+MapPickScreen = defclass(MapPickScreen, gui.ZScreen)
+MapPickScreen.ATTRS{
+    focus_path='prefer-stockpile/map-pick',
+    -- ZScreen defaults pass_mouse_clicks=true, which routes clicks outside
+    -- our (small) banner to the underlying DF viewscreen — so a click on a
+    -- stockpile would open its native dialog instead of toggling our link.
+    -- Consume all clicks; we route them ourselves in onInput.
+    pass_mouse_clicks=false,
+    target_bld=DEFAULT_NIL,
+    target_is_workshop=DEFAULT_NIL,
+}
+
+function MapPickScreen:init()
+    self.hover_text = ''
+    local what = self.target_is_workshop and 'stockpile' or 'workshop or furnace'
+    self:addviews{
+        widgets.Panel{
+            view_id='banner',
+            frame={t=0, l=0, w=70, h=4},
+            frame_style=gui.FRAME_THIN,
+            frame_background=gui.CLEAR_PEN,
+            subviews={
+                widgets.Label{
+                    frame={t=0, l=1},
+                    text={
+                        'Click a ', what,
+                        ' on the map to toggle its link with ',
+                        building_name(self.target_bld), '.',
+                    },
+                },
+                widgets.Label{
+                    view_id='hover',
+                    frame={t=1, l=1, h=1}, auto_height=false,
+                    text='',
+                },
+            },
+        },
+    }
+end
+
+function MapPickScreen:building_at_cursor()
+    local pos = dfhack.gui.getMousePos()
+    if not pos then return nil end
+    return dfhack.buildings.findAtTile(pos)
+end
+
+function MapPickScreen:candidate_matches(bld)
+    if not bld or bld.id == self.target_bld.id then return false end
+    if self.target_is_workshop then
+        return df.building_stockpilest:is_instance(bld)
+    end
+    return df.building_workshopst:is_instance(bld)
+        or df.building_furnacest:is_instance(bld)
+end
+
+function MapPickScreen:render(dc)
+    local bld = self:building_at_cursor()
+    if self:candidate_matches(bld) then
+        local linked
+        if self.target_is_workshop then
+            local by_ws = get_links_grouped()
+            linked = false
+            for _, id in ipairs(by_ws[self.target_bld.id] or {}) do
+                if id == bld.id then linked = true; break end
+            end
+        else
+            local _, by_sp = get_links_grouped()
+            linked = false
+            for _, id in ipairs(by_sp[self.target_bld.id] or {}) do
+                if id == bld.id then linked = true; break end
+            end
+        end
+        local marker = linked and '[x]' or '[ ]'
+        self.subviews.hover:setText(('hover: %s %s (#%d)'):format(
+            marker, building_name(bld), bld.id))
+    else
+        self.subviews.hover:setText('')
+    end
+    MapPickScreen.super.render(self, dc)
+end
+
+function MapPickScreen:onInput(keys)
+    if keys.LEAVESCREEN or keys._MOUSE_R then
+        self:dismiss()
+        return true
+    end
+    if keys._MOUSE_L then
+        -- Clicks landing on the banner go to its subviews via the normal
+        -- dispatch.  Clicks anywhere else are map clicks for us to handle —
+        -- check against the banner panel's own frame, not the screen's
+        -- (the screen frame covers the whole map, so checking it would
+        -- swallow every click).
+        if self.subviews.banner:getMouseFramePos() then
+            return MapPickScreen.super.onInput(self, keys)
+        end
+        local bld = self:building_at_cursor()
+        if self:candidate_matches(bld) then
+            local ws_id, sp_id
+            if self.target_is_workshop then
+                ws_id, sp_id = self.target_bld.id, bld.id
+            else
+                ws_id, sp_id = bld.id, self.target_bld.id
+            end
+            local linked = false
+            local by_ws = get_links_grouped()
+            for _, id in ipairs(by_ws[ws_id] or {}) do
+                if id == sp_id then linked = true; break end
+            end
+            if linked then remove_link(ws_id, sp_id)
+            else add_link(ws_id, sp_id) end
+        end
+        return true  -- always consume map clicks while in pick mode
+    end
+    return MapPickScreen.super.onInput(self, keys)
+end
+
+function MapPickScreen:onDismiss()
+    open_edit_dialog(self.target_bld, self.target_is_workshop)
+end
+
+-- ---------------------------------------------------------------------------
+
+open_edit_dialog = function(target_bld, is_workshop)
     return EditDialog{target_bld=target_bld, target_is_workshop=is_workshop}:show()
 end
 

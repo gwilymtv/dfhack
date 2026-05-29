@@ -83,7 +83,10 @@ a small "Preferred stockpiles" / "Preferred by workshops" panel with the
 current link count and an ``Edit preferred links`` button (default key
 ``p``).  The edit dialog lists every candidate building with a checkbox
 indicator; type to filter by name, press Enter to toggle the highlighted
-row.  Links are saved immediately via the same Lua API used by the
+row.  Press ``m`` to switch to map-pick mode: the dialog closes, and
+left-clicking any candidate building on the map toggles its link with
+the building you started from.  Esc or right-click returns to the
+dialog.  Links are saved immediately via the same Lua API used by the
 command-line subcommands.
 
 Notes
