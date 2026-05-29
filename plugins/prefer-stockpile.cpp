@@ -13,13 +13,17 @@
 
 #include "Debug.h"
 #include "LuaTools.h"
+#include "MiscUtils.h"
 #include "PluginLua.h"
 #include "PluginManager.h"
 
 #include "modules/Buildings.h"
+#include "modules/EventManager.h"
 #include "modules/Items.h"
 #include "modules/Job.h"
 #include "modules/Materials.h"
+#include "modules/Persistence.h"
+#include "modules/World.h"
 
 #include "df/building.h"
 #include "df/building_furnacest.h"
@@ -53,6 +57,115 @@ static std::map<int32_t, std::vector<int32_t>> prefer_links;
 
 // Tracks the highest seen job id so listNewlyCreated returns only fresh jobs.
 static int last_job_id = 0;
+
+// ---------------------------------------------------------------------------
+// Persistence
+//
+// Site-scoped (per save) storage following the preserve-rooms.cpp pattern:
+// one PersistentDataItem for config (enabled flag), another whose string
+// payload is a comma-separated list of slash-separated link entries.
+// Each entry is "sp_id1/sp_id2/.../ws_id" (workshop id last).
+
+static const auto CONFIG_KEY = std::string(plugin_name) + "/config";
+static const auto LINKS_KEY  = std::string(plugin_name) + "/links";
+
+static PersistentDataItem config;
+
+enum ConfigValues {
+    CONFIG_IS_ENABLED = 0,
+    CONFIG_SCHEMA_VERSION = 1,
+};
+
+// Bump on any backwards-incompatible change to the persisted format.
+// Lives on the config item (outside the blob) so a migration step can
+// inspect it without first parsing potentially-incompatible link data.
+static const int SCHEMA_VERSION = 1;
+
+static std::string serialize_links() {
+    std::vector<std::string> elems;
+    for (auto &kv : prefer_links) {
+        std::vector<std::string> strs;
+        for (int32_t sp : kv.second) strs.push_back(std::to_string(sp));
+        strs.push_back(std::to_string(kv.first));
+        elems.push_back(join_strings("/", strs));
+    }
+    return join_strings(",", elems);
+}
+
+static void deserialize_links(const std::string &s) {
+    prefer_links.clear();
+    if (s.empty()) return;
+    std::vector<std::string> elems;
+    split_string(&elems, s, ",");
+    for (auto &elem : elems) {
+        std::vector<std::string> parts;
+        split_string(&parts, elem, "/");
+        if (parts.size() <= 1) continue;
+        int32_t ws_id = string_to_int(parts.back(), -1);
+        parts.pop_back();
+        if (ws_id < 0) continue;
+        std::vector<int32_t> sps;
+        for (auto &p : parts) {
+            int32_t sp = string_to_int(p, -1);
+            if (sp >= 0) sps.push_back(sp);
+        }
+        if (!sps.empty()) prefer_links[ws_id] = sps;
+    }
+}
+
+static void persist_links() {
+    auto item = World::GetPersistentSiteData(LINKS_KEY);
+    if (!item.isValid()) item = World::AddPersistentSiteData(LINKS_KEY);
+    item.set_str(serialize_links());
+}
+
+// Drops entries whose workshop or stockpile no longer exists.
+// Returns true if anything was removed.
+static bool cleanup_stale_links() {
+    bool changed = false;
+    for (auto it = prefer_links.begin(); it != prefer_links.end(); ) {
+        if (!df::building::find(it->first)) {
+            it = prefer_links.erase(it);
+            changed = true;
+            continue;
+        }
+        auto &vec = it->second;
+        auto new_end = std::remove_if(vec.begin(), vec.end(),
+            [](int32_t sp) { return !df::building::find(sp); });
+        if (new_end != vec.end()) {
+            vec.erase(new_end, vec.end());
+            changed = true;
+        }
+        if (vec.empty()) {
+            it = prefer_links.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    return changed;
+}
+
+// Fires for both newly created and newly destroyed buildings; we only act
+// on the destruction case (find() returns nullptr for a destroyed id).
+static void on_building_event(color_ostream &out, void *data) {
+    int32_t bld_id = (int32_t)(intptr_t)data;
+    if (df::building::find(bld_id)) return;
+
+    bool changed = false;
+    if (prefer_links.erase(bld_id)) changed = true;
+    for (auto it = prefer_links.begin(); it != prefer_links.end(); ) {
+        auto &vec = it->second;
+        auto new_end = std::remove(vec.begin(), vec.end(), bld_id);
+        if (new_end != vec.end()) {
+            vec.erase(new_end, vec.end());
+            changed = true;
+        }
+        if (vec.empty()) it = prefer_links.erase(it);
+        else ++it;
+    }
+    if (changed) persist_links();
+}
 
 // ---------------------------------------------------------------------------
 // Forward declarations
@@ -326,6 +439,7 @@ static void add_link(color_ostream &out, int32_t workshop_id,
         }
     }
     vec.push_back(stockpile_id);
+    persist_links();
     out.print("added: {} -> {}\n",
               building_label(workshop_id), building_label(stockpile_id));
 }
@@ -345,6 +459,7 @@ static void remove_link(color_ostream &out, int32_t workshop_id,
                       building_label(workshop_id), building_label(stockpile_id));
             if (vec.empty())
                 prefer_links.erase(it);
+            persist_links();
             return;
         }
     }
@@ -360,6 +475,7 @@ static void remove_all_for_workshop(color_ostream &out, int32_t workshop_id) {
     }
     out.print("removed all links for {}\n", building_label(workshop_id));
     prefer_links.erase(it);
+    persist_links();
 }
 
 static void remove_stockpile_from_all(color_ostream &out, int32_t stockpile_id) {
@@ -382,6 +498,8 @@ static void remove_stockpile_from_all(color_ostream &out, int32_t stockpile_id) 
     }
     if (count == 0)
         out.print("no links found for {}\n", building_label(stockpile_id));
+    else
+        persist_links();
 }
 
 static void list_buildings(color_ostream &out) {
@@ -407,6 +525,25 @@ static void list_buildings(color_ostream &out) {
     }
 }
 
+// Pushes a flat array of {workshop_id, stockpile_id} pairs.  Lua side
+// groups/filters as needed (e.g. by workshop for the workshop overlay,
+// by stockpile for the stockpile overlay).
+static int prefer_stockpile_getLinks(lua_State *L) {
+    lua_newtable(L);
+    int outer = lua_gettop(L);
+    int idx = 1;
+    for (auto &kv : prefer_links) {
+        for (int32_t sp_id : kv.second) {
+            lua_newtable(L);
+            int row = lua_gettop(L);
+            Lua::SetField(L, kv.first, row, "workshop_id");
+            Lua::SetField(L, sp_id,    row, "stockpile_id");
+            lua_rawseti(L, outer, idx++);
+        }
+    }
+    return 1;
+}
+
 DFHACK_PLUGIN_LUA_FUNCTIONS {
     DFHACK_LUA_FUNCTION(print_status),
     DFHACK_LUA_FUNCTION(add_link),
@@ -414,6 +551,11 @@ DFHACK_PLUGIN_LUA_FUNCTIONS {
     DFHACK_LUA_FUNCTION(remove_all_for_workshop),
     DFHACK_LUA_FUNCTION(remove_stockpile_from_all),
     DFHACK_LUA_FUNCTION(list_buildings),
+    DFHACK_LUA_END
+};
+
+DFHACK_PLUGIN_LUA_COMMANDS {
+    DFHACK_LUA_COMMAND(prefer_stockpile_getLinks),
     DFHACK_LUA_END
 };
 
@@ -438,10 +580,62 @@ DFhackCExport command_result plugin_init(color_ostream &out,
         plugin_name,
         "Prefer nearby stockpile items for workshop jobs.",
         do_command));
+
+    // Building event fires for both creation and destruction (we filter to
+    // destruction by checking find() == nullptr).  Registered once at init;
+    // EventManager keeps the registration across world load/unload cycles.
+    EventManager::EventHandler bld_handler(plugin_self, on_building_event, 0);
+    EventManager::registerListener(EventManager::EventType::BUILDING, bld_handler);
+
     return CR_OK;
 }
 
 DFhackCExport command_result plugin_shutdown(color_ostream &out) {
+    EventManager::unregisterAll(plugin_self);
+    return CR_OK;
+}
+
+DFhackCExport command_result plugin_load_site_data(color_ostream &out) {
+    config = World::GetPersistentSiteData(CONFIG_KEY);
+    if (!config.isValid()) {
+        config = World::AddPersistentSiteData(CONFIG_KEY);
+        config.set_bool(CONFIG_IS_ENABLED, false);
+        config.set_int(CONFIG_SCHEMA_VERSION, SCHEMA_VERSION);
+    }
+    is_enabled = config.get_bool(CONFIG_IS_ENABLED);
+
+    int saved_version = config.get_int(CONFIG_SCHEMA_VERSION);
+    // saved_version == 0 means "pre-schema-marker" — same on-disk format as
+    // v1, just unstamped — adopt as v1 silently.  Any other mismatch we
+    // refuse to read until a migration is written.
+    if (saved_version == 0) {
+        config.set_int(CONFIG_SCHEMA_VERSION, SCHEMA_VERSION);
+        saved_version = SCHEMA_VERSION;
+    }
+    if (saved_version != SCHEMA_VERSION) {
+        WARN(log, out).print(
+            "persisted schema version {} != current {}; migration not "
+            "yet implemented, ignoring stored links\n",
+            saved_version, SCHEMA_VERSION);
+        prefer_links.clear();
+    } else {
+        auto links_item = World::GetPersistentSiteData(LINKS_KEY);
+        deserialize_links(links_item.isValid() ? links_item.get_str() : "");
+    }
+
+    if (cleanup_stale_links())
+        persist_links();
+
+    // Drain new-job queue so we don't reprocess pre-existing jobs.
+    std::vector<df::job*> dummy;
+    Job::listNewlyCreated(&dummy, &last_job_id);
+
+    return CR_OK;
+}
+
+DFhackCExport command_result plugin_save_site_data(color_ostream &out) {
+    if (cleanup_stale_links())
+        persist_links();
     return CR_OK;
 }
 
@@ -452,6 +646,8 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
         Job::listNewlyCreated(&dummy, &last_job_id);
     }
     is_enabled = enable;
+    if (config.isValid())
+        config.set_bool(CONFIG_IS_ENABLED, is_enabled);
     return CR_OK;
 }
 
@@ -463,19 +659,12 @@ DFhackCExport void plugin_onupdate(color_ostream &out) {
 
 DFhackCExport void plugin_onstatechange(color_ostream &out,
                                         state_change_event event) {
-    switch (event) {
-    case SC_WORLD_LOADED:
-        // Drain the new-job queue so we don't reprocess pre-existing jobs.
-        {
-            std::vector<df::job*> dummy;
-            Job::listNewlyCreated(&dummy, &last_job_id);
-        }
-        break;
-    case SC_WORLD_UNLOADED:
+    // World load is handled by plugin_load_site_data (drains the new-job
+    // queue and restores persisted state).  On unload we zero our in-memory
+    // state so it can't leak into a subsequently loaded world.
+    if (event == SC_WORLD_UNLOADED) {
         prefer_links.clear();
         last_job_id = 0;
-        break;
-    default:
-        break;
+        config = PersistentDataItem();
     }
 }

@@ -17,6 +17,23 @@ stockpile, the job proceeds normally (DF falls back to its standard
 nearest-to-dwarf search).  Unlike vanilla stockpile-to-workshop links, jobs
 are never blocked — the preferred stockpile is a hint, not a requirement.
 
+Interaction with native stockpile links
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``prefer-stockpile`` runs first; native takes-from links act as the
+fallback.  Concretely:
+
+* If a preferred stockpile contains a valid item, the plugin pre-attaches
+  it and DF's own search is skipped for that slot — including any native
+  takes-from restriction on the workshop.  An empty native link will
+  *not* block the job in this case.
+* If no preferred stockpile has a valid item, DF runs its normal
+  selection, and native links re-enter the picture: an unsatisfied native
+  link will block the job as it would without this plugin.
+
+In other words, the native link becomes "what to do if nothing in any
+preferred stockpile fits."
+
 Usage
 -----
 
@@ -58,15 +75,31 @@ arguments to see current links.
     Removes a stockpile from the preference lists of specific workshops,
     or from all workshop preference lists if no workshop IDs are given.
 
+Overlay
+-------
+
+With the plugin loaded, opening a workshop, furnace, or stockpile shows
+a small "Preferred stockpiles" / "Preferred by workshops" panel with the
+current link count and an ``Edit preferred links`` button (default key
+``p``).  The edit dialog lists every candidate building with a checkbox
+indicator; type to filter by name, press Enter to toggle the highlighted
+row.  Links are saved immediately via the same Lua API used by the
+command-line subcommands.
+
 Notes
 -----
 
-* Links are not persisted across save/load yet.  Re-add them after
-  loading a save.
+* Links and the enabled/disabled state are persisted per save and
+  reloaded automatically.  Links referencing buildings that no longer
+  exist (e.g. destroyed workshops or removed stockpiles) are dropped
+  the moment the building disappears and on save/load as a safety net.
 * The plugin runs on every game tick (``plugin_onupdate``) and scans
   only jobs created since the last tick, so the overhead is minimal.
 * Item selection checks: not already in a job, not forbidden, sitting
-  in the preferred stockpile (via ``item->getStockpile()``), and
-  passing DFHack's ``isSuitableItem`` / ``isSuitableMaterial`` filters.
+  in the preferred stockpile (position-based check, since free items
+  return null from ``item->getStockpile()``), satisfying the same
+  job-item flag pre-checks ``buildingplan`` uses (type, build-mat,
+  metal-ore, tool-use), matching the job's specific material if set,
+  and passing ``Job::isSuitableMaterial``.
 * Enable DFHack debug output for ``prefer_stockpile:log`` to see
   per-attachment log lines.
