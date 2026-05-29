@@ -58,6 +58,19 @@ static std::map<int32_t, std::vector<int32_t>> prefer_links;
 // Tracks the highest seen job id so listNewlyCreated returns only fresh jobs.
 static int last_job_id = 0;
 
+// For each job we pre-attached to, remember the filter slot(s) we touched
+// and the quantity we decremented from.  Multi-iteration work orders reuse
+// the same job_id across iterations: when an iteration completes we restore
+// the quantity (so DF will accept items again on the next iteration) and
+// re-run our pre-attach so subsequent iterations also pull from preferred
+// stockpiles.  Without this, after iter 1 quantity stays at 0 and DF
+// produces output with no input consumed.
+struct AttachedSlot {
+    int filter_idx;
+    int original_quantity;
+};
+static std::map<int32_t, std::vector<AttachedSlot>> attached_jobs;
+
 // ---------------------------------------------------------------------------
 // Persistence
 //
@@ -341,65 +354,136 @@ static df::item *find_preferred_item(
     return nullptr;
 }
 
+// Try to pre-attach items from preferred stockpiles to every unfilled
+// filter slot of `job`.  Idempotent (skips slots already filled), so safe
+// to call again for the same job after an iteration completes.
+static void process_job(color_ostream &out, df::job *job) {
+    auto *holder = Job::getHolder(job);
+    if (!holder) return;
+
+    auto it = prefer_links.find(holder->id);
+    if (it == prefer_links.end()) return;
+    const auto &stockpile_ids = it->second;
+
+    std::set<int> assigned;
+    for (auto *iref : job->items)
+        if (iref->job_item_idx >= 0)
+            assigned.insert(iref->job_item_idx);
+
+    auto &elems = job->job_items.elements;
+    MaterialInfo job_mat(job->mat_type, job->mat_index);
+    std::string job_mat_str = job_mat.isValid() ? job_mat.toString() : "(any)";
+    out.print("prefer-stockpile: {} (job {}) at {} — {} slot(s), job material: {}\n",
+              Job::getName(job), job->id,
+              building_label(holder->id),
+              (int)elems.size(), job_mat_str);
+
+    for (size_t k = 0; k < job->items.size(); k++) {
+        auto *iref = job->items[k];
+        out.print("  pre-existing ref[{}]: slot={} role={} item={}\n",
+                  (int)k, iref->job_item_idx,
+                  ENUM_KEY_STR(job_role_type, iref->role),
+                  iref->item ? iref->item->id : -1);
+    }
+
+    for (int i = 0; i < (int)elems.size(); i++) {
+        if (assigned.count(i)) continue;
+        auto *jitem = elems[i];
+        if (!jitem) continue;
+
+        auto *item = find_preferred_item(out, i, job, jitem, stockpile_ids);
+        if (!item) continue;
+
+        if (Job::attachJobItem(job, item, df::job_role_type::Hauled, i)) {
+            // Mirror buildingplan_cycle.cpp: decrement the filter slot's
+            // quantity so DF treats it as fully satisfied and skips its
+            // own search.  Without this DF runs its selection anyway,
+            // attaching a second item as Reagent — that second item then
+            // determines the output material, while ours just gets
+            // hauled and consumed as a bonus.
+            attached_jobs[job->id].push_back({i, jitem->quantity});
+            --jitem->quantity;
+            out.print("  slot {}: pre-attached item {} ({})\n",
+                      i, item->id, Items::getDescription(item, 0, false));
+        } else {
+            out.print("  slot {}: attachJobItem failed for item {} ({})\n",
+                      i, item->id, Items::getDescription(item, 0, false));
+        }
+    }
+}
+
 static void process_new_jobs(color_ostream &out) {
     std::vector<df::job*> new_jobs;
     if (!Job::listNewlyCreated(&new_jobs, &last_job_id))
         return;
+    for (auto *job : new_jobs)
+        process_job(out, job);
+}
 
-    for (auto *job : new_jobs) {
-        auto *holder = Job::getHolder(job);
-        if (!holder) continue;
+// EventManager's JOB_COMPLETED only fires for repeat-flagged jobs, which
+// work-order-spawned workshop jobs are not.  Instead, on every tick we walk
+// tracked jobs and detect iteration boundaries by looking for our Hauled
+// ref disappearing from job.items (the iteration consumed it).  When that
+// happens we restore the filter quantity we decremented and re-run
+// pre-attach for the next iteration.
+static void sweep_attached_jobs(color_ostream &out) {
+    if (attached_jobs.empty()) return;
 
-        auto it = prefer_links.find(holder->id);
-        if (it == prefer_links.end()) continue;
-        const auto &stockpile_ids = it->second;
+    // Index live jobs by id once so we don't re-walk for each tracked entry.
+    std::map<int32_t, df::job*> live_jobs;
+    for (auto *link = world->jobs.list.next; link; link = link->next) {
+        if (link->item) live_jobs[link->item->id] = link->item;
+    }
 
-        // Which filter slots already have an item committed?
-        std::set<int> assigned;
-        for (auto *iref : job->items)
-            if (iref->job_item_idx >= 0)
-                assigned.insert(iref->job_item_idx);
+    std::vector<df::job*> to_reprocess;
 
-        auto &elems = job->job_items.elements;
-        MaterialInfo job_mat(job->mat_type, job->mat_index);
-        std::string job_mat_str = job_mat.isValid() ? job_mat.toString() : "(any)";
-        out.print("prefer-stockpile: {} (job {}) at {} — {} slot(s), job material: {}\n",
-                  Job::getName(job), job->id,
-                  building_label(holder->id),
-                  (int)elems.size(), job_mat_str);
-
-        for (size_t k = 0; k < job->items.size(); k++) {
-            auto *iref = job->items[k];
-            out.print("  pre-existing ref[{}]: slot={} role={} item={}\n",
-                      (int)k, iref->job_item_idx,
-                      ENUM_KEY_STR(job_role_type, iref->role),
-                      iref->item ? iref->item->id : -1);
+    for (auto it = attached_jobs.begin(); it != attached_jobs.end(); ) {
+        auto live_it = live_jobs.find(it->first);
+        if (live_it == live_jobs.end()) {
+            // Job destroyed (final iteration done or cancelled).
+            out.print("prefer-stockpile: job {} gone — dropping tracking"
+                      " ({} slot(s) had been attached)\n",
+                      it->first, (int)it->second.size());
+            it = attached_jobs.erase(it);
+            continue;
         }
+        df::job *job = live_it->second;
+        auto &elems = job->job_items.elements;
 
-        for (int i = 0; i < (int)elems.size(); i++) {
-            if (assigned.count(i)) continue;
-            auto *jitem = elems[i];
-            if (!jitem) continue;
+        bool any_refs = false;
+        for (auto &slot : it->second) {
+            for (auto *iref : job->items) {
+                if (iref->job_item_idx == slot.filter_idx
+                    && iref->role == df::job_role_type::Hauled) {
+                    any_refs = true; break;
+                }
+            }
+            if (any_refs) break;
+        }
+        if (any_refs) { ++it; continue; }
 
-            auto *item = find_preferred_item(out, i, job, jitem, stockpile_ids);
-            if (!item) continue;
-
-            if (Job::attachJobItem(job, item, df::job_role_type::Hauled, i)) {
-                // Mirror buildingplan_cycle.cpp: decrement the filter slot's
-                // quantity so DF treats it as fully satisfied and skips its
-                // own search.  Without this DF runs its selection anyway,
-                // attaching a second item as Reagent — that second item then
-                // determines the output material, while ours just gets
-                // hauled and consumed as a bonus.
-                --jitem->quantity;
-                out.print("  slot {}: pre-attached item {} ({})\n",
-                          i, item->id, Items::getDescription(item, 0, false));
-            } else {
-                out.print("  slot {}: attachJobItem failed for item {} ({})\n",
-                          i, item->id, Items::getDescription(item, 0, false));
+        // Our refs are gone — iteration finished.  Restore quantities and
+        // log the boundary so the user can correlate with what they see in
+        // game (job briefly idles before next iteration starts).
+        out.print("prefer-stockpile: job {} ({}): iteration boundary,"
+                  " restoring filter quantities and re-attaching\n",
+                  job->id, Job::getName(job));
+        for (auto &slot : it->second) {
+            if (slot.filter_idx < (int)elems.size() && elems[slot.filter_idx]) {
+                out.print("  slot {}: quantity {} -> {}\n",
+                          slot.filter_idx,
+                          elems[slot.filter_idx]->quantity,
+                          slot.original_quantity);
+                elems[slot.filter_idx]->quantity = slot.original_quantity;
             }
         }
+        it = attached_jobs.erase(it);
+        // Defer process_job until after the loop so we don't mutate
+        // attached_jobs while iterating it.
+        to_reprocess.push_back(job);
     }
+
+    for (df::job *job : to_reprocess) process_job(out, job);
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +738,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
 DFhackCExport void plugin_onupdate(color_ostream &out) {
     if (!is_enabled) return;
     if (!world || !world->map.block_index) return;
+    sweep_attached_jobs(out);
     process_new_jobs(out);
 }
 
@@ -664,6 +749,7 @@ DFhackCExport void plugin_onstatechange(color_ostream &out,
     // state so it can't leak into a subsequently loaded world.
     if (event == SC_WORLD_UNLOADED) {
         prefer_links.clear();
+        attached_jobs.clear();
         last_job_id = 0;
         config = PersistentDataItem();
     }
