@@ -81,9 +81,10 @@ Overlay
 With the plugin loaded, opening a workshop, furnace, or stockpile shows
 a small "Preferred stockpiles" / "Preferred by workshops" panel with the
 current link count and an ``Edit preferred links`` button (default key
-``p``).  The edit dialog lists every candidate building with a checkbox
-indicator; type to filter by name, press Enter to toggle the highlighted
-row.  Press ``m`` to switch to map-pick mode: the dialog closes, and
+``Alt+p``).  The edit dialog lists every candidate building with a
+checkbox indicator; type to filter by name, press Enter to toggle the
+highlighted row.  Press ``Alt+m`` to switch to map-pick mode: the dialog
+closes, and
 left-clicking any candidate building on the map toggles its link with
 the building you started from.  Esc or right-click returns to the
 dialog.  Links are saved immediately via the same Lua API used by the

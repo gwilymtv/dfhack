@@ -187,7 +187,11 @@ function EditDialog:init()
                 },
                 widgets.HotkeyLabel{
                     frame={l=14, b=0},
-                    key='CUSTOM_M',
+                    -- Alt+M: bare 'm' / Shift+M would be eaten by the
+                    -- FilteredList's filter EditField as typed input.
+                    -- Mirrors the overlay's Alt+P entry point for a
+                    -- consistent Alt-letter shortcut pair.
+                    key='CUSTOM_ALT_M',
                     label='Pick from map',
                     on_activate=self:callback('enter_map_pick'),
                 },
@@ -430,7 +434,7 @@ local function build_inline_panel(self, on_edit)
                 },
                 widgets.HotkeyLabel{
                     frame={l=1, t=1},
-                    key='CUSTOM_P',
+                    key='CUSTOM_ALT_P',
                     label='Edit preferred links',
                     on_activate=on_edit,
                 },
