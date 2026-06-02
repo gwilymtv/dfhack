@@ -9,7 +9,7 @@
 	url = ../../DFHack/clsocket.git
 [submodule "scripts2"]
 	path = scripts
-	url = ../../DFHack/scripts.git
+	url = https://github.com/gwilymtv/dfhack-scripts.git
 [submodule "depends/jsoncpp"]
 	path = depends/jsoncpp-sub
 	url = ../../DFHack/jsoncpp.git
