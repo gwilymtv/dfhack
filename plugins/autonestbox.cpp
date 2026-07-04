@@ -1,6 +1,8 @@
 // - full automation of handling mini-pastures over nestboxes:
 //   go through all pens, check if they are empty and placed over a nestbox
 //   find female tame egg-layer who is not assigned to another pen and assign it to nestbox pasture
+//   if a nestbox is claimed by an animal other than the zone's occupant, reassign the zone to the
+//   claimer when possible, and warn the player about claims that cannot be reconciled
 //   maybe check for minimum age? it's not that useful to fill nestboxes with freshly hatched birds
 //   state and sleep setting is saved the first time autonestbox is started (to avoid writing stuff if the plugin is never used)
 
@@ -47,6 +49,7 @@ enum ConfigValues {
 };
 
 static bool did_complain = false; // avoids message spam
+static bool did_complain_unreconciled = false; // ditto, for unreconciled nestbox claims
 static const int32_t CYCLE_TICKS = 6067;
 static int32_t cycle_timestamp = 0;  // world->frame_counter at last cycle
 
@@ -97,6 +100,7 @@ DFhackCExport command_result plugin_load_site_data (color_ostream &out) {
     DEBUG(control,out).print("loading persisted enabled state: {}\n",
                             is_enabled ? "true" : "false");
     did_complain = false;
+    did_complain_unreconciled = false;
     return CR_OK;
 }
 
@@ -150,6 +154,7 @@ static command_result df_autonestbox(color_ostream &out, vector<string> &paramet
 
     if (opts.now) {
         did_complain = false;
+        did_complain_unreconciled = false;
         autonestbox_cycle(out);
     }
     else {
@@ -161,12 +166,6 @@ static command_result df_autonestbox(color_ostream &out, vector<string> &paramet
 /////////////////////////////////////////////////////
 // cycle logic
 //
-
-static bool isEmptyPasture(df::building_civzonest *zone) {
-    if (!Buildings::isPenPasture(zone))
-        return false;
-    return (zone->assigned_units.size() == 0);
-}
 
 static bool isInBuiltCage(df::unit *unit) {
     for (auto building : world->buildings.all) {
@@ -205,7 +204,9 @@ static bool unlikely_to_revert_to_wild(df::unit *unit) {
     return Units::isTame(unit) && Units::isMarkedForTraining(unit);
 }
 
-static bool isFreeEgglayer(df::unit *unit) {
+// units that autonestbox is willing to assign to a nestbox zone,
+// disregarding whether they are already assigned somewhere
+static bool isEgglayerCandidate(df::unit *unit) {
     return Units::isActive(unit)
         && !Units::isUndead(unit)
         && Units::isFemale(unit)
@@ -213,10 +214,13 @@ static bool isFreeEgglayer(df::unit *unit) {
         && unlikely_to_revert_to_wild(unit)
         && Units::isOwnCiv(unit)
         && Units::isEggLayer(unit)
-        && !isAssigned(unit)
         && !Units::isGrazer(unit) // exclude grazing birds because they're messy
         && !Units::isMerchant(unit) // don't steal merchant mounts
         && !Units::isForest(unit);  // don't steal birds from traders, they hate that
+}
+
+static bool isFreeEgglayer(df::unit *unit) {
+    return isEgglayerCandidate(unit) && !isAssigned(unit);
 }
 
 static df::general_ref_building_civzone_assignedst * createCivzoneRef() {
@@ -242,51 +246,176 @@ static bool assignUnitToZone(color_ostream &out, df::unit *unit, df::building_ci
     return true;
 }
 
-// also assigns units to zone if they have already claimed the nestbox
-// and are not assigned elsewhere; returns number assigned
-static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzonest *> &free_zones) {
+static void eraseUnitFromZoneList(df::building_civzonest *zone, int32_t unit_id) {
+    auto &assigned = zone->assigned_units;
+    for (size_t idx = 0; idx < assigned.size(); ++idx) {
+        if (assigned[idx] == unit_id) {
+            assigned.erase(assigned.begin() + idx);
+            break;
+        }
+    }
+}
+
+static void removeUnitFromZone(color_ostream &out, df::unit *unit, df::building_civzonest *zone) {
+    for (size_t idx = 0; idx < unit->general_refs.size(); ++idx) {
+        auto ref = unit->general_refs[idx];
+        if (ref->getType() != df::general_ref_type::BUILDING_CIVZONE_ASSIGNED
+                || ref->getBuilding() != zone)
+            continue;
+        unit->general_refs.erase(unit->general_refs.begin() + idx);
+        delete ref;
+        break;
+    }
+    eraseUnitFromZoneList(zone, unit->id);
+
+    INFO(cycle,out).print("Unit {} ({}) unassigned from nestbox zone {} ({})\n",
+        unit->id, Units::getRaceName(unit),
+        zone->id, zone->name);
+}
+
+static bool zoneHasUnit(df::building_civzonest *zone, int32_t unit_id) {
+    for (int32_t id : zone->assigned_units) {
+        if (id == unit_id)
+            return true;
+    }
+    return false;
+}
+
+// nestbox must be in upper left corner
+// this could be made more flexible
+static df::building_nest_boxst * findNestboxAt(df::building_civzonest *zone) {
+    df::coord pos(zone->x1, zone->y1, zone->z);
+    auto bld = Buildings::findAtTile(pos);
+    if (!bld || bld->getType() != df::building_type::NestBox)
+        return NULL;
+    return virtual_cast<df::building_nest_boxst>(bld);
+}
+
+// a zone is in scope for autonestbox if it is an active pen/pasture with a
+// nestbox in its upper left corner; returns the nestbox, or NULL if the zone
+// is out of scope
+static df::building_nest_boxst * getInScopeNestbox(df::building_civzonest *zone) {
+    if (!zone || !Buildings::isPenPasture(zone) || !Buildings::isActive(zone))
+        return NULL;
+    return findNestboxAt(zone);
+}
+
+static df::building_civzonest * getAssignedCivzone(df::unit *unit) {
+    for (auto ref : unit->general_refs) {
+        if (ref->getType() == df::general_ref_type::BUILDING_CIVZONE_ASSIGNED)
+            return virtual_cast<df::building_civzonest>(ref->getBuilding());
+    }
+    return NULL;
+}
+
+// records a claimed nestbox that cannot be reconciled with its zone
+static void note_unreconciled(color_ostream &out, vector<string> &problems,
+        df::building_nest_boxst *nestbox, df::unit *claimer, const string &reason) {
+    std::stringstream ss;
+    ss << "Nestbox at (" << nestbox->x1 << "," << nestbox->y1 << "," << nestbox->z
+       << ") is claimed by " << Units::getReadableName(claimer) << ", but " << reason << ".";
+    problems.push_back(ss.str());
+    DEBUG(cycle,out).print("{}\n", problems.back());
+}
+
+// scans nestbox zones, reassigning zones to the units that have claimed their
+// nestboxes where necessary and possible. unclaimed empty zones are collected
+// in free_zones; claimed nestboxes that cannot be reconciled with their zones
+// are described in problems. returns the number of units assigned to
+// previously empty zones; reassigned counts zones where an existing
+// assignment had to be changed to match the nestbox claim
+static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzonest *> &free_zones,
+        vector<string> &problems, size_t &reassigned)
+{
     size_t assigned = 0;
     for (auto zone : world->buildings.other.ZONE_PEN) {
         TRACE(cycle,out).print("scanning pasture {} ({})\n", zone->id, zone->name);
+        if (!Buildings::isPenPasture(zone)) {
+            TRACE(cycle,out).print("pasture {} is not a pen/pasture\n", zone->id);
+            continue;
+        }
         if (!Buildings::isActive(zone)) {
             TRACE(cycle,out).print("pasture {} is inactive\n", zone->id);
             continue;
         }
-        if (!isEmptyPasture(zone)) {
-            TRACE(cycle,out).print("pasture {} is not empty\n", zone->id);
-            continue;
-        }
 
-        // nestbox must be in upper left corner
-        // this could be made more flexible
-        df::coord pos(zone->x1, zone->y1, zone->z);
-        auto bld = Buildings::findAtTile(pos);
-        if (!bld || bld->getType() != df::building_type::NestBox) {
+        auto nestbox = findNestboxAt(zone);
+        if (!nestbox) {
             TRACE(cycle,out).print("pasture {} does not have nestbox in upper left corner\n", zone->id);
             continue;
         }
-        TRACE(cycle,out).print("found nestbox {} in pasture {}\n", bld->id, zone->id);
+        TRACE(cycle,out).print("found nestbox {} in pasture {}\n", nestbox->id, zone->id);
 
-        df::building_nest_boxst *nestbox = virtual_cast<df::building_nest_boxst>(bld);
-        if (!nestbox) {
-            TRACE(cycle,out).print("nestbox {} is somehow not a nestbox\n", bld->id);
+        if (nestbox->claimed_by < 0) {
+            // an unclaimed zone is free if it has no occupant and no eggs in the nestbox
+            if (zone->assigned_units.empty() && nestbox->contained_items.size() == 1)
+                free_zones.push_back(zone);
             continue;
         }
 
-        if (nestbox->claimed_by >= 0) {
-            if (auto unit = df::unit::find(nestbox->claimed_by)) {
-                TRACE(cycle,out).print("nestbox {} is claimed by unit {} ({})\n", bld->id,
-                    nestbox->claimed_by, Units::getReadableName(unit));
-                if (!isFreeEgglayer(unit)) {
-                    DEBUG(cycle,out).print("cannot assign unit {} to nestbox {}: not a free egg layer\n", unit->id, bld->id);
-                } else {
-                    // if the nestbox is claimed by a free egg layer, attempt to assign that unit to the zone
-                    if (assignUnitToZone(out, unit, zone))
-                        ++assigned;
-                }
+        auto claimer = df::unit::find(nestbox->claimed_by);
+        if (!claimer) {
+            DEBUG(cycle,out).print("nestbox {} is claimed by nonexistent unit {}\n",
+                nestbox->id, nestbox->claimed_by);
+            continue;
+        }
+        TRACE(cycle,out).print("nestbox {} is claimed by unit {} ({})\n", nestbox->id,
+            nestbox->claimed_by, Units::getReadableName(claimer));
+
+        if (zoneHasUnit(zone, claimer->id)) {
+            TRACE(cycle,out).print("unit {} is already assigned to zone {}; nothing to do\n",
+                claimer->id, zone->id);
+            continue;
+        }
+
+        // the nestbox is claimed by a unit not assigned to the zone;
+        // try to reconcile by reassigning the zone to the claimer
+        if (!isEgglayerCandidate(claimer)) {
+            note_unreconciled(out, problems, nestbox, claimer,
+                "autonestbox will not assign them to a nestbox zone");
+            continue;
+        }
+        if (zone->assigned_units.size() > 1) {
+            note_unreconciled(out, problems, nestbox, claimer,
+                "the zone has multiple animals assigned to it");
+            continue;
+        }
+        df::building_civzonest *cur_zone = NULL;
+        if (isAssigned(claimer)) {
+            cur_zone = getAssignedCivzone(claimer);
+            auto cur_nestbox = getInScopeNestbox(cur_zone);
+            if (!cur_nestbox) {
+                note_unreconciled(out, problems, nestbox, claimer,
+                    "they are pastured, caged, or chained outside of any nestbox zone");
+                continue;
             }
-        } else if (nestbox->contained_items.size() == 1) {
-            free_zones.push_back(zone);
+            if (cur_nestbox->claimed_by == claimer->id && cur_zone != zone) {
+                note_unreconciled(out, problems, nestbox, claimer,
+                    "they are already nesting in a different nestbox zone");
+                continue;
+            }
+        }
+
+        // reassign the zone to the claimer. any displaced occupant becomes a
+        // free egg layer again and can be matched to a free zone
+        bool moved = false;
+        if (cur_zone) {
+            removeUnitFromZone(out, claimer, cur_zone);
+            moved = true;
+        }
+        vector<int32_t> occupants = zone->assigned_units;
+        for (int32_t unit_id : occupants) {
+            moved = true;
+            if (auto occupant = df::unit::find(unit_id))
+                removeUnitFromZone(out, occupant, zone);
+            else
+                eraseUnitFromZoneList(zone, unit_id);
+        }
+        if (assignUnitToZone(out, claimer, zone)) {
+            if (moved)
+                ++reassigned;
+            else
+                ++assigned;
         }
     }
     return assigned;
@@ -309,23 +438,26 @@ static vector<df::unit *> getFreeEggLayers(color_ostream &out) {
 static void rate_limit_complaining() {
     static df::season old_season = df::season::None;
     df::season this_season = *cur_season;
-    if (old_season != this_season)
+    if (old_season != this_season) {
         did_complain = false;
+        did_complain_unreconciled = false;
+    }
     old_season = this_season;
 }
 
-static size_t assign_nestboxes(color_ostream &out) {
+static size_t assign_nestboxes(color_ostream &out, size_t &reassigned) {
     rate_limit_complaining();
 
     vector<df::building_civzonest *> free_zones;
-    size_t assigned = getFreeNestboxZones(out, free_zones);
+    vector<string> problems;
+    size_t assigned = getFreeNestboxZones(out, free_zones, problems, reassigned);
     vector<df::unit *> free_units = getFreeEggLayers(out);
 
     const size_t max_idx = std::min(free_zones.size(), free_units.size());
     for (size_t idx = 0; idx < max_idx; ++idx) {
         if (!assignUnitToZone(out, free_units[idx], free_zones[idx])) {
             DEBUG(cycle,out).print("Failed to assign unit to building.\n");
-            return assigned;
+            break;
         }
         DEBUG(cycle,out).print("assigned unit {} to zone {}\n",
                                 free_units[idx]->id, free_zones[idx]->id);
@@ -342,6 +474,20 @@ static size_t assign_nestboxes(color_ostream &out) {
         Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_BROWN, true);
         did_complain = true;
     }
+
+    if (!problems.empty() && !did_complain_unreconciled) {
+        for (auto &problem : problems)
+            out << problem << std::endl;
+        string announce = problems[0];
+        if (problems.size() > 1) {
+            std::stringstream ss;
+            ss << problems.size() << " nestboxes are claimed by animals that autonestbox"
+                " cannot assign to their zones (see the DFHack console for details).";
+            announce = ss.str();
+        }
+        Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_BROWN, true);
+        did_complain_unreconciled = true;
+    }
     return assigned;
 }
 
@@ -351,10 +497,23 @@ static void autonestbox_cycle(color_ostream &out) {
 
     DEBUG(cycle,out).print("running autonestbox cycle\n");
 
-    size_t assigned = assign_nestboxes(out);
+    size_t reassigned = 0;
+    size_t assigned = assign_nestboxes(out, reassigned);
     if (assigned > 0) {
         std::stringstream ss;
         ss << assigned << " nestbox" << (assigned == 1 ? " was" : "es were") << " assigned to roaming egg layers.";
+        string announce = ss.str();
+        out << announce << std::endl;
+        Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_GREEN, false);
+        // can complain again
+        did_complain = false;
+    }
+    if (reassigned > 0) {
+        std::stringstream ss;
+        if (reassigned == 1)
+            ss << "1 nestbox zone was reassigned to the animal nesting in it.";
+        else
+            ss << reassigned << " nestbox zones were reassigned to the animals nesting in them.";
         string announce = ss.str();
         out << announce << std::endl;
         Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_GREEN, false);
