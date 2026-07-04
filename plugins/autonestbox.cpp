@@ -387,6 +387,14 @@ static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzon
         df::building_civzonest *cur_zone = NULL;
         if (isAssigned(claimer)) {
             cur_zone = getAssignedCivzone(claimer);
+            // the claimer may be pastured over this nestbox via a zone that
+            // autonestbox does not manage; that arrangement works as it is
+            if (cur_zone && cur_zone != zone && cur_zone->z == nestbox->z
+                    && Buildings::containsTile(cur_zone, df::coord2d(nestbox->x1, nestbox->y1))) {
+                TRACE(cycle,out).print("unit {} is pastured over nestbox {} via zone {}; nothing to do\n",
+                    claimer->id, nestbox->id, cur_zone->id);
+                continue;
+            }
             auto cur_nestbox = getInScopeNestbox(cur_zone);
             if (!cur_nestbox) {
                 note_unreconciled(out, problems, nestbox, claimer,
@@ -438,6 +446,15 @@ static void findStrayClaims(color_ostream &out, const std::set<int32_t> &in_scop
         auto claimer = df::unit::find(nestbox->claimed_by);
         if (!claimer || !isEgglayerCandidate(claimer)) {
             TRACE(cycle,out).print("ignoring claim on out of scope nestbox {}\n", nestbox->id);
+            continue;
+        }
+        // if the claimer is pastured in a zone that contains the nestbox, the
+        // arrangement works even though autonestbox is not managing it
+        auto cur_zone = getAssignedCivzone(claimer);
+        if (cur_zone && cur_zone->z == nestbox->z
+                && Buildings::containsTile(cur_zone, df::coord2d(nestbox->x1, nestbox->y1))) {
+            TRACE(cycle,out).print("unit {} is pastured over its claimed nestbox {}; nothing to do\n",
+                claimer->id, nestbox->id);
             continue;
         }
         note_unreconciled(out, problems, nestbox, claimer,

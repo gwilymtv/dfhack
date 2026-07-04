@@ -23,7 +23,9 @@ somewhere outside of `autonestbox`'s control -- an announcement is made so you
 can resolve the situation manually. You will also be warned when an animal
 that `autonestbox` would otherwise manage has claimed a nestbox that is not in
 a manageable zone, such as a nestbox with no pasture zone over it, or one that
-is not in the top left corner of its pasture.
+is not in the top left corner of its pasture. No warning is given when the
+animal is pastured in a zone that covers its claimed nestbox, since that
+arrangement works on its own.
 
 Usage
 -----
