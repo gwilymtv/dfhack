@@ -20,7 +20,10 @@ be matched with a different nestbox zone. If a nestbox is claimed by an animal
 that `autonestbox` cannot assign to its zone -- for example, an animal that is
 not an egg-laying female pet, or one that is pastured, caged, or chained
 somewhere outside of `autonestbox`'s control -- an announcement is made so you
-can resolve the situation manually.
+can resolve the situation manually. You will also be warned when an animal
+that `autonestbox` would otherwise manage has claimed a nestbox that is not in
+a manageable zone, such as a nestbox with no pasture zone over it, or one that
+is not in the top left corner of its pasture.
 
 Usage
 -----

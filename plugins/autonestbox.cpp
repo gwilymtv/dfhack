@@ -6,6 +6,8 @@
 //   maybe check for minimum age? it's not that useful to fill nestboxes with freshly hatched birds
 //   state and sleep setting is saved the first time autonestbox is started (to avoid writing stuff if the plugin is never used)
 
+#include <set>
+
 #include "Debug.h"
 #include "LuaTools.h"
 #include "PluginManager.h"
@@ -320,12 +322,13 @@ static void note_unreconciled(color_ostream &out, vector<string> &problems,
 
 // scans nestbox zones, reassigning zones to the units that have claimed their
 // nestboxes where necessary and possible. unclaimed empty zones are collected
-// in free_zones; claimed nestboxes that cannot be reconciled with their zones
-// are described in problems. returns the number of units assigned to
-// previously empty zones; reassigned counts zones where an existing
-// assignment had to be changed to match the nestbox claim
+// in free_zones; the ids of all nestboxes that are in a manageable zone are
+// collected in in_scope_nestboxes; claimed nestboxes that cannot be reconciled
+// with their zones are described in problems. returns the number of units
+// assigned to previously empty zones; reassigned counts zones where an
+// existing assignment had to be changed to match the nestbox claim
 static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzonest *> &free_zones,
-        vector<string> &problems, size_t &reassigned)
+        std::set<int32_t> &in_scope_nestboxes, vector<string> &problems, size_t &reassigned)
 {
     size_t assigned = 0;
     for (auto zone : world->buildings.other.ZONE_PEN) {
@@ -345,6 +348,7 @@ static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzon
             continue;
         }
         TRACE(cycle,out).print("found nestbox {} in pasture {}\n", nestbox->id, zone->id);
+        in_scope_nestboxes.insert(nestbox->id);
 
         if (nestbox->claimed_by < 0) {
             // an unclaimed zone is free if it has no occupant and no eggs in the nestbox
@@ -421,6 +425,26 @@ static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzon
     return assigned;
 }
 
+// warns about nestboxes that are claimed by animals autonestbox should be
+// managing, but that are not in a zone autonestbox can manage (e.g. a nestbox
+// with no zone at all, or one that is not in the upper left corner of its
+// pasture)
+static void findStrayClaims(color_ostream &out, const std::set<int32_t> &in_scope_nestboxes,
+        vector<string> &problems)
+{
+    for (auto nestbox : world->buildings.other.NEST_BOX) {
+        if (nestbox->claimed_by < 0 || in_scope_nestboxes.count(nestbox->id))
+            continue;
+        auto claimer = df::unit::find(nestbox->claimed_by);
+        if (!claimer || !isEgglayerCandidate(claimer)) {
+            TRACE(cycle,out).print("ignoring claim on out of scope nestbox {}\n", nestbox->id);
+            continue;
+        }
+        note_unreconciled(out, problems, nestbox, claimer,
+            "the nestbox is not in a zone that autonestbox can manage");
+    }
+}
+
 static vector<df::unit *> getFreeEggLayers(color_ostream &out) {
     vector<df::unit *> ret;
     for (auto unit : world->units.active) {
@@ -449,8 +473,10 @@ static size_t assign_nestboxes(color_ostream &out, size_t &reassigned) {
     rate_limit_complaining();
 
     vector<df::building_civzonest *> free_zones;
+    std::set<int32_t> in_scope_nestboxes;
     vector<string> problems;
-    size_t assigned = getFreeNestboxZones(out, free_zones, problems, reassigned);
+    size_t assigned = getFreeNestboxZones(out, free_zones, in_scope_nestboxes, problems, reassigned);
+    findStrayClaims(out, in_scope_nestboxes, problems);
     vector<df::unit *> free_units = getFreeEggLayers(out);
 
     const size_t max_idx = std::min(free_zones.size(), free_units.size());
@@ -481,8 +507,8 @@ static size_t assign_nestboxes(color_ostream &out, size_t &reassigned) {
         string announce = problems[0];
         if (problems.size() > 1) {
             std::stringstream ss;
-            ss << problems.size() << " nestboxes are claimed by animals that autonestbox"
-                " cannot assign to their zones (see the DFHack console for details).";
+            ss << problems.size() << " nestboxes have claims that autonestbox"
+                " cannot reconcile (see the DFHack console for details).";
             announce = ss.str();
         }
         Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_BROWN, true);
