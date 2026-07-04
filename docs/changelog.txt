@@ -64,6 +64,7 @@ Template for new versions:
 ## Fixes
 
 ## Misc Improvements
+- `autonestbox`: when an animal claims the nestbox in a zone assigned to a different animal, reassign the zone to the claimer, and warn when a claimed nestbox cannot be reconciled with its zone or is not in a zone autonestbox can manage
 
 ## Documentation
 
