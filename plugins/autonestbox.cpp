@@ -320,15 +320,31 @@ static void note_unreconciled(color_ostream &out, vector<string> &problems,
     DEBUG(cycle,out).print("{}\n", problems.back());
 }
 
+// clears a nestbox claim that the claiming unit cannot or will not use
+static void clearRedundantClaim(color_ostream &out, df::building_nest_boxst *nestbox,
+        df::unit *claimer, size_t &cleared)
+{
+    if (claimer)
+        INFO(cycle,out).print("clearing redundant claim on nestbox {} by unit {} ({})\n",
+            nestbox->id, claimer->id, Units::getReadableName(claimer));
+    else
+        INFO(cycle,out).print("clearing claim on nestbox {} by missing unit {}\n",
+            nestbox->id, nestbox->claimed_by);
+    nestbox->claimed_by = -1;
+    ++cleared;
+}
+
 // scans nestbox zones, reassigning zones to the units that have claimed their
-// nestboxes where necessary and possible. unclaimed empty zones are collected
-// in free_zones; the ids of all nestboxes that are in a manageable zone are
-// collected in in_scope_nestboxes; claimed nestboxes that cannot be reconciled
-// with their zones are described in problems. returns the number of units
-// assigned to previously empty zones; reassigned counts zones where an
-// existing assignment had to be changed to match the nestbox claim
+// nestboxes and clearing redundant claims where necessary and possible.
+// unclaimed empty zones are collected in free_zones; the ids of all nestboxes
+// that are in a manageable zone are collected in in_scope_nestboxes; claimed
+// nestboxes that cannot be reconciled with their zones are described in
+// problems. returns the number of units assigned to previously empty zones;
+// reassigned counts zones where an existing assignment had to be changed to
+// match the nestbox claim; cleared counts claims that were cleared
 static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzonest *> &free_zones,
-        std::set<int32_t> &in_scope_nestboxes, vector<string> &problems, size_t &reassigned)
+        std::set<int32_t> &in_scope_nestboxes, vector<string> &problems, size_t &reassigned,
+        size_t &cleared)
 {
     size_t assigned = 0;
     for (auto zone : world->buildings.other.ZONE_PEN) {
@@ -358,9 +374,11 @@ static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzon
         }
 
         auto claimer = df::unit::find(nestbox->claimed_by);
-        if (!claimer) {
-            DEBUG(cycle,out).print("nestbox {} is claimed by nonexistent unit {}\n",
-                nestbox->id, nestbox->claimed_by);
+        if (!claimer || !Units::isActive(claimer)) {
+            // claimed by a unit that is dead or gone
+            clearRedundantClaim(out, nestbox, claimer, cleared);
+            if (zone->assigned_units.empty() && nestbox->contained_items.size() == 1)
+                free_zones.push_back(zone);
             continue;
         }
         TRACE(cycle,out).print("nestbox {} is claimed by unit {} ({})\n", nestbox->id,
@@ -372,40 +390,52 @@ static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzon
             continue;
         }
 
-        // the nestbox is claimed by a unit not assigned to the zone;
-        // try to reconcile by reassigning the zone to the claimer
-        if (!isEgglayerCandidate(claimer)) {
+        // the claimer may be pastured over this nestbox via a zone that
+        // autonestbox does not manage; that arrangement works as it is
+        auto cur_zone = getAssignedCivzone(claimer);
+        if (cur_zone && cur_zone != zone && cur_zone->z == nestbox->z
+                && Buildings::containsTile(cur_zone, df::coord2d(nestbox->x1, nestbox->y1))) {
+            TRACE(cycle,out).print("unit {} is pastured over nestbox {} via zone {}; nothing to do\n",
+                claimer->id, nestbox->id, cur_zone->id);
+            continue;
+        }
+
+        // the nestbox is claimed by a unit not assigned to the zone. decide
+        // whether to reconcile by reassigning the zone to the claimer or by
+        // clearing a claim the claimer cannot or will not use
+        bool reconcile_by_assignment = false;
+        if (isEgglayerCandidate(claimer)) {
+            if (!isAssigned(claimer)) {
+                // free egg layer; give it the zone
+                reconcile_by_assignment = true;
+            } else if (cur_zone) {
+                // pull the claimer out of another managed zone unless it is
+                // already nesting there
+                auto cur_nestbox = getInScopeNestbox(cur_zone);
+                if (cur_nestbox && (cur_nestbox->claimed_by != claimer->id || cur_zone == zone))
+                    reconcile_by_assignment = true;
+            }
+        } else if (!isAssigned(claimer)) {
+            // a roaming animal that autonestbox will not manage may still come
+            // back to use this nestbox; the player has to resolve this one
             note_unreconciled(out, problems, nestbox, claimer,
                 "autonestbox will not assign them to a nestbox zone");
             continue;
         }
+
+        if (!reconcile_by_assignment) {
+            // the claimer is nesting in a different zone or is pastured,
+            // caged, or chained somewhere it cannot use this nestbox
+            clearRedundantClaim(out, nestbox, claimer, cleared);
+            if (zone->assigned_units.empty() && nestbox->contained_items.size() == 1)
+                free_zones.push_back(zone);
+            continue;
+        }
+
         if (zone->assigned_units.size() > 1) {
             note_unreconciled(out, problems, nestbox, claimer,
                 "the zone has multiple animals assigned to it");
             continue;
-        }
-        df::building_civzonest *cur_zone = NULL;
-        if (isAssigned(claimer)) {
-            cur_zone = getAssignedCivzone(claimer);
-            // the claimer may be pastured over this nestbox via a zone that
-            // autonestbox does not manage; that arrangement works as it is
-            if (cur_zone && cur_zone != zone && cur_zone->z == nestbox->z
-                    && Buildings::containsTile(cur_zone, df::coord2d(nestbox->x1, nestbox->y1))) {
-                TRACE(cycle,out).print("unit {} is pastured over nestbox {} via zone {}; nothing to do\n",
-                    claimer->id, nestbox->id, cur_zone->id);
-                continue;
-            }
-            auto cur_nestbox = getInScopeNestbox(cur_zone);
-            if (!cur_nestbox) {
-                note_unreconciled(out, problems, nestbox, claimer,
-                    "they are pastured, caged, or chained outside of any nestbox zone");
-                continue;
-            }
-            if (cur_nestbox->claimed_by == claimer->id && cur_zone != zone) {
-                note_unreconciled(out, problems, nestbox, claimer,
-                    "they are already nesting in a different nestbox zone");
-                continue;
-            }
         }
 
         // reassign the zone to the claimer. any displaced occupant becomes a
@@ -433,12 +463,13 @@ static size_t getFreeNestboxZones(color_ostream &out, vector<df::building_civzon
     return assigned;
 }
 
-// warns about nestboxes that are claimed by animals autonestbox should be
-// managing, but that are not in a zone autonestbox can manage (e.g. a nestbox
-// with no zone at all, or one that is not in the upper left corner of its
-// pasture)
+// handles nestboxes that are not in a zone autonestbox can manage (e.g. a
+// nestbox with no zone at all, or one that is not in the upper left corner of
+// its pasture) but are claimed by animals autonestbox should be managing.
+// claims held by animals that are assigned to a managed nestbox zone are
+// cleared; other claims are warned about
 static void findStrayClaims(color_ostream &out, const std::set<int32_t> &in_scope_nestboxes,
-        vector<string> &problems)
+        vector<string> &problems, size_t &cleared)
 {
     for (auto nestbox : world->buildings.other.NEST_BOX) {
         if (nestbox->claimed_by < 0 || in_scope_nestboxes.count(nestbox->id))
@@ -455,6 +486,12 @@ static void findStrayClaims(color_ostream &out, const std::set<int32_t> &in_scop
                 && Buildings::containsTile(cur_zone, df::coord2d(nestbox->x1, nestbox->y1))) {
             TRACE(cycle,out).print("unit {} is pastured over its claimed nestbox {}; nothing to do\n",
                 claimer->id, nestbox->id);
+            continue;
+        }
+        if (cur_zone && getInScopeNestbox(cur_zone)) {
+            // the claimer is managed by autonestbox in another zone; this
+            // outside claim just keeps it from nesting where it belongs
+            clearRedundantClaim(out, nestbox, claimer, cleared);
             continue;
         }
         note_unreconciled(out, problems, nestbox, claimer,
@@ -486,14 +523,14 @@ static void rate_limit_complaining() {
     old_season = this_season;
 }
 
-static size_t assign_nestboxes(color_ostream &out, size_t &reassigned) {
+static size_t assign_nestboxes(color_ostream &out, size_t &reassigned, size_t &cleared) {
     rate_limit_complaining();
 
     vector<df::building_civzonest *> free_zones;
     std::set<int32_t> in_scope_nestboxes;
     vector<string> problems;
-    size_t assigned = getFreeNestboxZones(out, free_zones, in_scope_nestboxes, problems, reassigned);
-    findStrayClaims(out, in_scope_nestboxes, problems);
+    size_t assigned = getFreeNestboxZones(out, free_zones, in_scope_nestboxes, problems,
+        reassigned, cleared);
     vector<df::unit *> free_units = getFreeEggLayers(out);
 
     const size_t max_idx = std::min(free_zones.size(), free_units.size());
@@ -506,6 +543,11 @@ static size_t assign_nestboxes(color_ostream &out, size_t &reassigned) {
                                 free_units[idx]->id, free_zones[idx]->id);
         ++assigned;
     }
+
+    // run after the assignment pass so that units that were just assigned to
+    // a nestbox zone get any claims they hold on out of scope nestboxes
+    // cleared right away
+    findStrayClaims(out, in_scope_nestboxes, problems, cleared);
 
     if (free_zones.size() < free_units.size() && !did_complain) {
         size_t num_needed = free_units.size() - free_zones.size();
@@ -541,7 +583,8 @@ static void autonestbox_cycle(color_ostream &out) {
     DEBUG(cycle,out).print("running autonestbox cycle\n");
 
     size_t reassigned = 0;
-    size_t assigned = assign_nestboxes(out, reassigned);
+    size_t cleared = 0;
+    size_t assigned = assign_nestboxes(out, reassigned, cleared);
     if (assigned > 0) {
         std::stringstream ss;
         ss << assigned << " nestbox" << (assigned == 1 ? " was" : "es were") << " assigned to roaming egg layers.";
@@ -557,6 +600,15 @@ static void autonestbox_cycle(color_ostream &out) {
             ss << "1 nestbox zone was reassigned to the animal nesting in it.";
         else
             ss << reassigned << " nestbox zones were reassigned to the animals nesting in them.";
+        string announce = ss.str();
+        out << announce << std::endl;
+        Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_GREEN, false);
+        // can complain again
+        did_complain = false;
+    }
+    if (cleared > 0) {
+        std::stringstream ss;
+        ss << cleared << " redundant nestbox claim" << (cleared == 1 ? " was" : "s were") << " cleared.";
         string announce = ss.str();
         out << announce << std::endl;
         Gui::showAnnouncement("[DFHack autonestbox] " + announce, COLOR_GREEN, false);
