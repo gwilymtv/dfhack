@@ -72,6 +72,36 @@ Template for new versions:
 
 ## Removed
 
+# 53.15-r2
+
+## New Tools
+
+## New Features
+- `buildingplan`: add a ``Pull`` button next to linked levers on a building's "Show linked buildings" tab so you can queue a high-priority pull-lever job (or cancel a queued one) without navigating to the lever
+
+## Fixes
+- `autoclothing`: correct defect in validating material specification on command line
+- `autolabor`: Fix running 1 tick less frequently than intended.
+- `buildingplan`: fixed non-clickable pressure plates's triggers (issue #5736)
+- `getplants`: added protective code to avoid misoperation when a plant has an invalid material (which should never happen, but...)
+
+## Misc Improvements
+- `buildingplan`: added a slider on the weapontrap overlay
+- `buildingplan`: added a small tooltip text about renaming favorites in the UI
+- `buildingplan`: buildingplan can now generate work orders
+- `orders`: exported orders now include a human-readable ``name`` field
+
+## Documentation
+
+## API
+- Core: added ``getConfigPath()`` API for obtaining the path to user-specific configuration files
+- ``widgets.RadioButton``: New button widget resembling those used in ``gui/control-panel``
+
+## Lua
+- Added ``dfhack.getConfigPath()`` API, proxying ``Core::getConfigPath``
+
+## Removed
+
 # 53.15-r1
 
 ## New Tools
